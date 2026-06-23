@@ -1,0 +1,10 @@
+[project]
+name = "memoli-agent"
+version = "0.1.0"
+description = "A memory-focused extensible agent runtime."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pyright]
+include = ["memoli_agent"]
+pythonVersion = "3.11"

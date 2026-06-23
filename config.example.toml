@@ -1,0 +1,24 @@
+[llm]
+provider = "openai-compatible"
+model = "gpt-4.1-mini"
+api_key = ""
+base_url = ""
+
+[agent]
+name = "Memoli"
+max_iterations = 8
+history_window = 20
+
+[memory]
+enabled = true
+engine = "markdown"
+path = "workspace/memory"
+
+[tools]
+tool_search_enabled = true
+
+[channels.cli]
+enabled = true
+
+[plugins]
+enabled = ["memory_default", "shell_safety"]
