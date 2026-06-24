@@ -1,0 +1,273 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2300" viewBox="0 0 1800 2300">
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .title { font: 700 42px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 400 20px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #4b5563; }
+      .section-title { font: 700 25px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #111827; }
+      .node-title { font: 700 20px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #111827; }
+      .node-path { font: 600 14px "Consolas", "Microsoft YaHei", monospace; fill: #2563eb; }
+      .node-body { font: 400 15px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #374151; }
+      .small { font: 400 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #4b5563; }
+      .tiny { font: 400 12px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #6b7280; }
+      .panel { fill: #ffffff; stroke: #d8dee9; stroke-width: 1.5; rx: 8; }
+      .node { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; rx: 8; }
+      .entry { fill: #eff6ff; stroke: #60a5fa; }
+      .runtime { fill: #eefdf8; stroke: #34d399; }
+      .bus { fill: #fff7ed; stroke: #fb923c; }
+      .agent { fill: #f5f3ff; stroke: #a78bfa; }
+      .pipeline { fill: #fdf2f8; stroke: #f472b6; }
+      .reason { fill: #ecfeff; stroke: #22d3ee; }
+      .tool { fill: #f0fdf4; stroke: #4ade80; }
+      .output { fill: #fefce8; stroke: #facc15; }
+      .phase { fill: #ffffff; stroke: #f472b6; stroke-width: 1.2; rx: 8; }
+      .arrow { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .soft-arrow { stroke: #94a3b8; stroke-width: 1.8; fill: none; marker-end: url(#arrow-soft); }
+      .dash { stroke-dasharray: 7 6; }
+      .label { font: 600 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #334155; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-soft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="2300"/>
+
+  <text class="title" x="70" y="70">Memoli-agent 第六阶段项目结构流程图</text>
+  <text class="subtitle" x="72" y="108">当前阶段：消息总线 + Runtime 装配 + Session/Context + LLM Provider + PassiveTurnPipeline + ToolRegistry</text>
+
+  <!-- Panel 1 -->
+  <rect class="panel" x="50" y="140" width="1700" height="940"/>
+  <text class="section-title" x="80" y="185">一、项目结构装配图：main.py 启动后，各核心模块如何被创建和连接</text>
+
+  <!-- Top entry nodes -->
+  <rect class="node entry" x="90" y="235" width="300" height="130"/>
+  <text class="node-title" x="115" y="270">main.py</text>
+  <text class="node-path" x="115" y="294">程序入口</text>
+  <text class="node-body" x="115" y="322">启动 asyncio 主流程</text>
+  <text class="node-body" x="115" y="346">加载配置并运行 Runtime</text>
+
+  <rect class="node entry" x="450" y="235" width="300" height="130"/>
+  <text class="node-title" x="475" y="270">bootstrap/config.py</text>
+  <text class="node-path" x="475" y="294">load_config()</text>
+  <text class="node-body" x="475" y="322">读取 config.toml</text>
+  <text class="node-body" x="475" y="346">缺失时使用默认配置</text>
+
+  <rect class="node runtime" x="810" y="225" width="360" height="150"/>
+  <text class="node-title" x="835" y="260">bootstrap/app.py</text>
+  <text class="node-path" x="835" y="284">build_app_runtime()</text>
+  <text class="node-body" x="835" y="312">项目总装配中心</text>
+  <text class="node-body" x="835" y="336">创建 Bus / Loop / Runner</text>
+  <text class="node-body" x="835" y="360">装配 Provider / Pipeline / Tools</text>
+
+  <path class="arrow" d="M390 300 H450"/>
+  <path class="arrow" d="M750 300 H810"/>
+
+  <!-- Runtime components -->
+  <rect class="node bus" x="90" y="460" width="300" height="135"/>
+  <text class="node-title" x="115" y="495">bus/queue.py</text>
+  <text class="node-path" x="115" y="519">MessageBus</text>
+  <text class="node-body" x="115" y="547">维护 inbound/outbound 队列</text>
+  <text class="node-body" x="115" y="571">连接通道和主 agent</text>
+
+  <rect class="node bus" x="90" y="650" width="300" height="135"/>
+  <text class="node-title" x="115" y="685">bus/events.py</text>
+  <text class="node-path" x="115" y="709">Message 类型</text>
+  <text class="node-body" x="115" y="737">InboundMessage：用户输入</text>
+  <text class="node-body" x="115" y="761">OutboundMessage：agent 回复</text>
+
+  <rect class="node output" x="90" y="840" width="300" height="135"/>
+  <text class="node-title" x="115" y="875">channels/cli.py</text>
+  <text class="node-path" x="115" y="899">CLI Channel</text>
+  <text class="node-body" x="115" y="927">读取终端输入</text>
+  <text class="node-body" x="115" y="951">打印 agent 输出</text>
+
+  <rect class="node agent" x="470" y="445" width="330" height="150"/>
+  <text class="node-title" x="495" y="480">agent/loop.py</text>
+  <text class="node-path" x="495" y="504">AgentLoop</text>
+  <text class="node-body" x="495" y="532">消息泵：消费 inbound</text>
+  <text class="node-body" x="495" y="556">调用 runner</text>
+  <text class="node-body" x="495" y="580">发布 outbound</text>
+
+  <rect class="node agent" x="470" y="635" width="330" height="150"/>
+  <text class="node-title" x="495" y="670">agent/runner.py</text>
+  <text class="node-path" x="495" y="694">AgentRunner</text>
+  <text class="node-body" x="495" y="722">入站消息路由器</text>
+  <text class="node-body" x="495" y="746">当前交给 PassiveTurnPipeline</text>
+
+  <rect class="node pipeline" x="880" y="445" width="360" height="160"/>
+  <text class="node-title" x="905" y="480">agent/core/passive_turn.py</text>
+  <text class="node-path" x="905" y="504">PassiveTurnPipeline</text>
+  <text class="node-body" x="905" y="532">一轮被动对话编排入口</text>
+  <text class="node-body" x="905" y="556">串联生命周期阶段</text>
+  <text class="node-body" x="905" y="580">输出最终 OutboundMessage</text>
+
+  <rect class="node pipeline" x="880" y="650" width="360" height="150"/>
+  <text class="node-title" x="905" y="685">agent/lifecycle/*.py</text>
+  <text class="node-path" x="905" y="709">默认生命周期阶段</text>
+  <text class="node-body" x="905" y="737">BeforeTurn / PromptRender</text>
+  <text class="node-body" x="905" y="761">Reasoner / AfterTurn</text>
+
+  <rect class="node reason" x="1320" y="245" width="340" height="145"/>
+  <text class="node-title" x="1345" y="280">agent/provider.py</text>
+  <text class="node-path" x="1345" y="304">LLMProvider</text>
+  <text class="node-body" x="1345" y="332">EchoProvider：本地回显</text>
+  <text class="node-body" x="1345" y="356">OpenAI-compatible：真实模型</text>
+
+  <rect class="node reason" x="1320" y="445" width="340" height="150"/>
+  <text class="node-title" x="1345" y="480">agent/core/reasoner.py</text>
+  <text class="node-path" x="1345" y="504">Reasoner</text>
+  <text class="node-body" x="1345" y="532">调用模型 provider</text>
+  <text class="node-body" x="1345" y="556">执行一轮 tool call</text>
+
+  <rect class="node tool" x="1320" y="650" width="340" height="160"/>
+  <text class="node-title" x="1345" y="685">agent/tools/*.py</text>
+  <text class="node-path" x="1345" y="709">ToolRegistry + 内置工具</text>
+  <text class="node-body" x="1345" y="737">注册工具并导出 schema</text>
+  <text class="node-body" x="1345" y="761">执行 calculator / time</text>
+  <text class="node-body" x="1345" y="785">memory 临时工具 / 文件读取</text>
+
+  <rect class="node agent" x="880" y="850" width="360" height="145"/>
+  <text class="node-title" x="905" y="885">Session + Context</text>
+  <text class="node-path" x="905" y="909">session.py / context.py</text>
+  <text class="node-body" x="905" y="937">SessionManager 保存多轮历史</text>
+  <text class="node-body" x="905" y="961">ContextBuilder 构造 messages</text>
+
+  <!-- Architecture arrows -->
+  <path class="soft-arrow" d="M990 375 V420"/>
+  <path class="soft-arrow" d="M960 375 C820 420 620 410 620 445"/>
+  <path class="soft-arrow" d="M930 375 C620 410 240 410 240 460"/>
+  <path class="soft-arrow" d="M1040 375 C1210 400 1490 390 1490 445"/>
+  <path class="soft-arrow" d="M1090 375 C1260 470 1490 530 1490 650"/>
+
+  <path class="arrow" d="M390 528 H470"/>
+  <path class="arrow" d="M635 595 V635"/>
+  <path class="arrow" d="M800 710 H880"/>
+  <path class="arrow" d="M1240 525 H1320"/>
+  <path class="arrow" d="M1490 595 V650"/>
+  <path class="soft-arrow dash" d="M1490 445 V390"/>
+  <path class="soft-arrow" d="M1060 605 V650"/>
+  <path class="soft-arrow" d="M1060 800 V850"/>
+  <path class="soft-arrow" d="M390 908 C540 870 660 820 800 710"/>
+
+  <!-- Tool list badges -->
+  <rect class="node tool" x="1320" y="855" width="155" height="54"/>
+  <text class="node-body" x="1340" y="889">time</text>
+  <rect class="node tool" x="1505" y="855" width="155" height="54"/>
+  <text class="node-body" x="1525" y="889">calculator</text>
+  <rect class="node tool" x="1320" y="930" width="155" height="54"/>
+  <text class="node-body" x="1340" y="964">memory_*</text>
+  <rect class="node tool" x="1505" y="930" width="155" height="54"/>
+  <text class="node-body" x="1525" y="964">filesystem</text>
+  <path class="soft-arrow" d="M1490 810 V855"/>
+
+  <!-- Panel 2 -->
+  <rect class="panel" x="50" y="1120" width="1700" height="1070"/>
+  <text class="section-title" x="80" y="1165">二、运行时消息流程图：用户输入如何变成最终回复</text>
+
+  <!-- Left runtime input/output -->
+  <rect class="node output" x="90" y="1225" width="300" height="115"/>
+  <text class="node-title" x="115" y="1260">用户输入</text>
+  <text class="node-path" x="115" y="1284">终端文本</text>
+  <text class="node-body" x="115" y="1312">例如：计算 12 * 8 + 3</text>
+
+  <rect class="node output" x="90" y="1390" width="300" height="125"/>
+  <text class="node-title" x="115" y="1425">CLI 通道</text>
+  <text class="node-path" x="115" y="1449">channels/cli.py</text>
+  <text class="node-body" x="115" y="1477">包装 InboundMessage</text>
+  <text class="node-body" x="115" y="1501">等待 OutboundMessage</text>
+
+  <rect class="node bus" x="90" y="1570" width="300" height="125"/>
+  <text class="node-title" x="115" y="1605">MessageBus</text>
+  <text class="node-path" x="115" y="1629">inbound / outbound</text>
+  <text class="node-body" x="115" y="1657">异步队列传递消息</text>
+  <text class="node-body" x="115" y="1681">解耦 channel 和 agent</text>
+
+  <rect class="node output" x="90" y="1970" width="300" height="125"/>
+  <text class="node-title" x="115" y="2005">打印回复</text>
+  <text class="node-path" x="115" y="2029">CLI 输出</text>
+  <text class="node-body" x="115" y="2057">展示 agent 最终回答</text>
+  <text class="node-body" x="115" y="2081">无 key 时通常是 Echo</text>
+
+  <!-- Agent chain -->
+  <rect class="node agent" x="480" y="1270" width="300" height="115"/>
+  <text class="node-title" x="505" y="1305">AgentLoop</text>
+  <text class="node-path" x="505" y="1329">消息泵</text>
+  <text class="node-body" x="505" y="1357">取 inbound，调 runner</text>
+
+  <rect class="node agent" x="480" y="1435" width="300" height="115"/>
+  <text class="node-title" x="505" y="1470">AgentRunner</text>
+  <text class="node-path" x="505" y="1494">消息路由</text>
+  <text class="node-body" x="505" y="1522">普通用户消息进入 pipeline</text>
+
+  <rect class="node pipeline" x="850" y="1210" width="390" height="90"/>
+  <text class="node-title" x="875" y="1245">BeforeTurn</text>
+  <text class="node-body" x="875" y="1273">获取 Session，创建 TurnState</text>
+
+  <rect class="node pipeline" x="850" y="1340" width="390" height="90"/>
+  <text class="node-title" x="875" y="1375">BeforeReasoning</text>
+  <text class="node-body" x="875" y="1403">预留扩展点：工具上下文、记忆、技能</text>
+
+  <rect class="node pipeline" x="850" y="1470" width="390" height="90"/>
+  <text class="node-title" x="875" y="1505">PromptRender</text>
+  <text class="node-body" x="875" y="1533">构造 system + history + user messages</text>
+
+  <rect class="node reason" x="850" y="1600" width="390" height="90"/>
+  <text class="node-title" x="875" y="1635">ReasonerPhase</text>
+  <text class="node-body" x="875" y="1663">调用 Reasoner 生成回复或 tool_calls</text>
+
+  <rect class="node pipeline" x="850" y="1835" width="390" height="90"/>
+  <text class="node-title" x="875" y="1870">AfterReasoning</text>
+  <text class="node-body" x="875" y="1898">保存用户消息和助手回复到 Session</text>
+
+  <rect class="node pipeline" x="850" y="1965" width="390" height="90"/>
+  <text class="node-title" x="875" y="2000">AfterTurn</text>
+  <text class="node-body" x="875" y="2028">创建 OutboundMessage 和 metadata</text>
+
+  <!-- Reasoner details -->
+  <rect class="node reason" x="1320" y="1225" width="340" height="135"/>
+  <text class="node-title" x="1345" y="1260">Provider.chat</text>
+  <text class="node-path" x="1345" y="1284">messages + tools</text>
+  <text class="node-body" x="1345" y="1312">EchoProvider 或真实模型</text>
+  <text class="node-body" x="1345" y="1336">返回文本或 tool_calls</text>
+
+  <rect class="node tool" x="1320" y="1430" width="340" height="135"/>
+  <text class="node-title" x="1345" y="1465">ToolRegistry.execute</text>
+  <text class="node-path" x="1345" y="1489">工具执行</text>
+  <text class="node-body" x="1345" y="1517">执行模型请求的工具</text>
+  <text class="node-body" x="1345" y="1541">错误返回 ToolResult，不崩溃</text>
+
+  <rect class="node reason" x="1320" y="1635" width="340" height="135"/>
+  <text class="node-title" x="1345" y="1670">二次 Provider.chat</text>
+  <text class="node-path" x="1345" y="1694">messages + tool result</text>
+  <text class="node-body" x="1345" y="1722">把工具结果交给模型</text>
+  <text class="node-body" x="1345" y="1746">生成最终自然语言回复</text>
+
+  <!-- Runtime arrows -->
+  <path class="arrow" d="M240 1340 V1390"/>
+  <path class="arrow" d="M240 1515 V1570"/>
+  <path class="arrow" d="M390 1632 H480 V1328"/>
+  <path class="arrow" d="M630 1385 V1435"/>
+  <path class="arrow" d="M780 1492 H850 V1255"/>
+  <path class="arrow" d="M1045 1300 V1340"/>
+  <path class="arrow" d="M1045 1430 V1470"/>
+  <path class="arrow" d="M1045 1560 V1600"/>
+  <path class="arrow" d="M1240 1645 H1320 V1292"/>
+  <path class="soft-arrow" d="M1490 1360 V1430"/>
+  <path class="soft-arrow" d="M1490 1565 V1635"/>
+  <path class="soft-arrow" d="M1320 1702 H1240 V1835"/>
+  <path class="arrow" d="M1045 1690 V1835"/>
+  <path class="arrow" d="M1045 1925 V1965"/>
+  <path class="arrow" d="M850 2010 H390 V2032"/>
+  <path class="arrow" d="M240 1695 V1970"/>
+
+  <text class="label" x="1270" y="1618">有 tool_calls 时</text>
+  <text class="label" x="1115" y="1795">无 tool_calls 时直接进入保存阶段</text>
+
+  <!-- Footer -->
+  <rect class="panel" x="50" y="2215" width="1700" height="45"/>
+  <text class="small" x="75" y="2244">说明：第六阶段只执行一轮工具调用；memory_write / memory_recall 是进程内临时记忆；filesystem_read 默认限制在 workspace 目录。</text>
+</svg>

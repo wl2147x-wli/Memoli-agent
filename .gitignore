@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Memoli-agent local runtime files
+config.toml
+workspace/
+logs/
+*.local.toml
+*.local.json
+*.sqlite
+*.sqlite3
+*.db
