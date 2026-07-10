@@ -38,9 +38,9 @@
 ```text
 config.example.toml
 pyproject.toml
-requirements.txt
+pyproject.toml
 README.md
-AGENT_PROJECT_BLUEPRINT.md
+docs/architecture/project-blueprint.md
 ```
 
 验收标准：
@@ -57,7 +57,7 @@ AGENT_PROJECT_BLUEPRINT.md
 - 已创建 `.env.example`。
 - 已完善 `pyproject.toml`。
 - 已更新 `.gitignore`，忽略本地配置和运行时数据。
-- 已创建 `PROJECT_CONVENTIONS.md`。
+- 已创建 `docs/development/conventions.md`。
 - 已更新 `README.md`。
 
 ## 1. 消息总线阶段（已完成）
@@ -442,7 +442,7 @@ class MemoryRuntime:
 - 已在 `ContextBuilder` 中注入可选 memory prompt block。
 - 已将 `memory_write` 和 `memory_recall` 从进程内临时记忆改为 Markdown 长期记忆。
 - 已实现 `build_memory_runtime()`，并在 `AppRuntime` 中完成记忆系统装配。
-- 已新增 `MEMORY_SYSTEM.md` 说明记忆文件职责和当前限制。
+- 已新增 `docs/systems/memory.md` 说明记忆文件职责和当前限制。
 
 ## 8. Lifecycle 与插件阶段（已完成）
 
@@ -493,7 +493,7 @@ memoli_agent/plugins/memory_default/plugin.py
 - 已将 `tool_pre` hook 接入 `ToolRegistry.execute()`。
 - 已实现默认插件 `memory_default` 和 `shell_safety`。
 - 已在 `AppRuntime` 中装配插件加载、注册、初始化和关闭流程。
-- 已新增 `PLUGIN_SYSTEM.md` 说明插件目录、hook 名称和默认插件行为。
+- 已新增 `docs/systems/plugins.md` 说明插件目录、hook 名称和默认插件行为。
 
 ## 9. SubAgent 阶段（已完成）
 
@@ -553,7 +553,7 @@ memoli_agent/bootstrap/app.py
 - 已实现 `SubAgentManager`，支持同步任务、后台任务、task_id 和 task_dir。
 - 已实现 `spawn_subagent` 工具，并接入 `ToolRegistry`。
 - 已新增 `bootstrap/subagent.py`，在 `AppRuntime` 中集中装配 SubAgentManager。
-- 已新增 `[subagent]` 配置和 `SUBAGENT_SYSTEM.md` 文档。
+- 已新增 `[subagent]` 配置和 `docs/systems/subagents.md` 文档。
 
 ## 10. Proactive 阶段（已完成）
 
@@ -594,7 +594,7 @@ memoli_agent/agent/proactive/
 - 已新增 `bootstrap/proactive.py`，在 `AppRuntime` 中集中装配主动循环。
 - 已新增 `[proactive]` 配置，默认关闭主动循环。
 - 已调整 CLI 为输入/输出双任务模型，支持主动消息自动显示。
-- 已新增 `PROACTIVE_SYSTEM.md` 文档。
+- 已新增 `docs/systems/proactive.md` 文档。
 
 ## 11. MCP 阶段（已完成）
 
@@ -635,7 +635,7 @@ memoli_agent/agent/mcp/
 - 已实现 `MCPToolAdapter`，把 MCP 工具适配为现有 `Tool` 协议。
 - 已新增 `bootstrap/mcp.py`，在 `AppRuntime` 中集中装配 MCP client manager。
 - 已将 MCP 工具注册到现有 `ToolRegistry`，工具名格式为 `mcp__server__tool`。
-- 已新增 `[mcp]` 配置示例和 `MCP_SYSTEM.md` 文档。
+- 已新增 `[mcp]` 配置示例和 `docs/systems/mcp.md` 文档。
 
 ## 12. Peer Agent 阶段
 

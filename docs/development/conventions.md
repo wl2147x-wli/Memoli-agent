@@ -127,11 +127,11 @@ tests/
 
 - 清晰的目录骨架。
 - `README.md`。
-- `AGENT_PROJECT_BLUEPRINT.md`。
-- `DEVELOPMENT_ROADMAP.md`。
-- `PROJECT_CONVENTIONS.md`。
+- `docs/architecture/project-blueprint.md`。
+- `docs/development/roadmap.md`。
+- `docs/development/conventions.md`。
 - `config.example.toml`。
 - `.env.example`。
 - `pyproject.toml`。
-- `requirements.txt`。
+- `pyproject.toml`。
 - `.gitignore` 忽略本地配置和运行时数据。

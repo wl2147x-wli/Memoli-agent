@@ -226,3 +226,9 @@ logs/
 *.sqlite
 *.sqlite3
 *.db
+
+# Benchmark outputs and locally staged third-party source trees
+workspace/benchmark/
+benchmark-results/
+vendor-local/
+third_party_local/

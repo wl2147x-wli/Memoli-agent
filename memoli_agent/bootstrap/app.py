@@ -18,6 +18,7 @@ from memoli_agent.agent.core.prompt_blocks import build_system_prompt
 from memoli_agent.agent.core.reasoner import Reasoner
 from memoli_agent.agent.mcp.registry import MCPClientManager
 from memoli_agent.agent.memory.consolidator import MemoryConsolidator
+from memoli_agent.agent.memory.runtime import MemoryRuntime
 from memoli_agent.agent.loop import AgentLoop
 from memoli_agent.agent.plugins.context import PluginContext
 from memoli_agent.agent.plugins.decorators import HookRegistry
@@ -48,6 +49,8 @@ class AppRuntime:
     bus: MessageBus
     agent_loop: AgentLoop
     tool_registry: ToolRegistry
+    runner: AgentRunner
+    memory_runtime: MemoryRuntime | None = None
     plugin_manager: PluginManager | None = None
     proactive_loop: ProactiveLoop | None = None
     mcp_manager: MCPClientManager | None = None
@@ -149,6 +152,8 @@ def build_app_runtime(config: AppConfig) -> AppRuntime:
         bus=bus,
         agent_loop=agent_loop,
         tool_registry=tool_registry,
+        runner=runner,
+        memory_runtime=memory_runtime,
         plugin_manager=plugin_manager,
         proactive_loop=proactive_loop,
         mcp_manager=mcp_manager,

@@ -1,6 +1,6 @@
 # Memoli-agent 项目架构蓝图
 
-本文档用于规划如何在 `D:\wli\project1\Memoli-agent` 中模仿 `demo-akashic` / `akashic-agent` 写一个新的 agent 项目。
+本文档记录 Memoli-agent 的早期架构规划及模块职责。
 
 目标不是一开始就复刻全部复杂能力，而是搭出一个可运行、可扩展、边界清晰的 agent 框架。后续可以逐步加入记忆、插件、工具、MCP、子 agent、主动任务等能力。
 
@@ -45,9 +45,8 @@ bootstrap/AppRuntime
 ```text
 Memoli-agent/
   README.md
-  AGENT_PROJECT_BLUEPRINT.md
+  docs/
   config.example.toml
-  requirements.txt
   pyproject.toml
   main.py
 

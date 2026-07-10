@@ -1,2 +1,0 @@
-# MCP client SDK，用于连接本地 stdio MCP server。
-mcp>=1.27,<2

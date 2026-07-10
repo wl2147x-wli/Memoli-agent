@@ -1,0 +1,30 @@
+[dataset]
+name = "longmemeval"
+path = "../LongMemEval/data/longmemeval_s_cleaned.json"
+split = "s"
+sample_size = 1
+seed = 42
+question_types = ["single-session-user", "single-session-assistant", "single-session-preference", "temporal-reasoning", "knowledge-update", "multi-session", "abstention"]
+max_sessions = 0
+
+[agent]
+type = "memoli"
+config_path = "config.benchmark.toml"
+workspace_root = "workspace/benchmark"
+reset_per_sample = true
+reset_memory_per_sample = true
+ingest_mode = "memory_write"
+answer_mode = "agent_turn"
+capture_retrieved_context = true
+
+[metrics]
+primary = "judge"
+include_retrieval_recall = true
+judge_enabled = false
+judge_model = "gpt-4o-mini"
+
+[output]
+dir = "workspace/benchmark/results"
+save_predictions = true
+save_metrics = true
+save_report = true

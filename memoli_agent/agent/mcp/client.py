@@ -47,7 +47,7 @@ class MCPClient:
             from mcp.client.stdio import stdio_client
         except ImportError as exc:
             raise RuntimeError(
-                "未安装 MCP Python SDK，请先安装 requirements.txt 中的 mcp 依赖。"
+                "未安装 MCP Python SDK，请使用 pyproject.toml 安装项目依赖。"
             ) from exc
 
         exit_stack = AsyncExitStack()

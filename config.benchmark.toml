@@ -1,0 +1,39 @@
+[runtime]
+workspace = "workspace/benchmark/runtime"
+
+[llm]
+provider = "openai-compatible"
+model = "deepseek-v4-flash"
+api_key = ""
+base_url = "https://api.deepseek.com"
+
+[agent]
+name = "Memoli"
+max_iterations = 8
+history_window = 20
+
+[memory]
+enabled = true
+engine = "markdown"
+path = "workspace/benchmark/runtime/memory"
+
+[tools]
+tool_search_enabled = true
+
+[channels.cli]
+enabled = false
+
+[plugins]
+enabled = ["memory_default", "shell_safety"]
+
+[subagent]
+enabled = false
+root = "workspace/benchmark/runtime/subagents"
+default_profile = "general"
+max_concurrent = 1
+
+[proactive]
+enabled = false
+
+[mcp]
+enabled = false
