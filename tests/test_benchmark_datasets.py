@@ -20,7 +20,11 @@ def test_locomo_adapter_parses_sessions_and_questions(tmp_path: Path) -> None:
                         "speaker_b": "Bob",
                         "session_1_date_time": "1 pm",
                         "session_1": [
-                            {"speaker": "Alice", "dia_id": "D1:1", "text": "I like tea."},
+                            {
+                                "speaker": "Alice",
+                                "dia_id": "D1:1",
+                                "text": "I like tea.",
+                            },
                             {"speaker": "Bob", "dia_id": "D1:2", "text": "Nice."},
                         ],
                     },
@@ -63,7 +67,13 @@ def test_longmemeval_adapter_maps_abstention(tmp_path: Path) -> None:
                     "haystack_dates": ["2023/01/01 10:00"],
                     "haystack_session_ids": ["s1"],
                     "haystack_sessions": [
-                        [{"role": "user", "content": "My cat is Luna.", "has_answer": True}]
+                        [
+                            {
+                                "role": "user",
+                                "content": "My cat is Luna.",
+                                "has_answer": True,
+                            }
+                        ]
                     ],
                     "answer_session_ids": ["s1"],
                 }

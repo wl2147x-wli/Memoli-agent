@@ -1,0 +1,14 @@
+schema_version = 1
+id = "resource_bomb"
+version = "1.0.0"
+execution = "sandbox"
+hooks = ["turn.after"]
+tools = ["resource_bomb"]
+
+[resources]
+hook_deadline_seconds = 0.1
+memory_mb = 64
+cpus = 0.25
+pids = 8
+max_output_bytes = 4096
+max_rpc_bytes = 4096

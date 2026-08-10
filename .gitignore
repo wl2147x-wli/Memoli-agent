@@ -49,6 +49,9 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.test-tmp/
+.test-tmp-*/
+.verification-tmp/
 cover/
 
 # Translations
@@ -226,6 +229,9 @@ logs/
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+workspace/trajectory-payloads/
 
 # Benchmark outputs and locally staged third-party source trees
 workspace/benchmark/

@@ -15,7 +15,10 @@ from benchmarks.datasets.base import BenchmarkPrediction, BenchmarkQuestion
 from benchmarks.datasets.locomo import LocomoDatasetAdapter
 from benchmarks.datasets.longmemeval import LongMemEvalDatasetAdapter
 from benchmarks.metrics.common import aggregate
-from benchmarks.metrics.locomo import DEFAULT_LOCOMO_EVAL_SCRIPT, evaluate_locomo_official
+from benchmarks.metrics.locomo import (
+    DEFAULT_LOCOMO_EVAL_SCRIPT,
+    evaluate_locomo_official,
+)
 from benchmarks.reports.writer import ReportWriter
 
 
@@ -31,10 +34,7 @@ async def run_benchmark(config) -> Path:
     samples = _build_dataset_adapter(config).load()
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (
-        Path(config.output.dir)
-        / config.dataset.name
-        / config.dataset.split
-        / run_id
+        Path(config.output.dir) / config.dataset.name / config.dataset.split / run_id
     )
     writer = ReportWriter(output_dir)
     agent = create_agent_adapter(
@@ -130,7 +130,9 @@ def _has_provider_warning(record: dict[str, Any]) -> bool:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Memoli benchmarks.")
-    parser.add_argument("--config", required=True, help="Path to benchmark TOML config.")
+    parser.add_argument(
+        "--config", required=True, help="Path to benchmark TOML config."
+    )
     args, overrides = parser.parse_known_args()
     args.overrides = overrides
     return args

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +62,7 @@ class MarkdownMemoryStore:
             metadata=dict(metadata or {}),
         )
         metadata_text = _format_metadata(item.metadata)
-        line = (
-            f"- [{timestamp.isoformat()}] ({source}) {item.content}"
-            f"{metadata_text}\n"
-        )
+        line = f"- [{timestamp.isoformat()}] ({source}) {item.content}{metadata_text}\n"
         self.memory_file.write_text(
             self.memory_file.read_text(encoding="utf-8") + line,
             encoding="utf-8",
@@ -109,7 +106,9 @@ class MarkdownMemoryStore:
         if not path.exists():
             path.write_text(default_content, encoding="utf-8")
 
-    def _load_items_from_file(self, path: Path, default_source: str) -> list[MemoryItem]:
+    def _load_items_from_file(
+        self, path: Path, default_source: str
+    ) -> list[MemoryItem]:
         """从 Markdown 文件中读取 bullet 记忆条目。"""
 
         items: list[MemoryItem] = []
@@ -124,7 +123,7 @@ class MarkdownMemoryStore:
 def utc_now() -> datetime:
     """返回当前 UTC 时间。"""
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _format_metadata(metadata: dict[str, Any]) -> str:

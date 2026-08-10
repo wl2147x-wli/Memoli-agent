@@ -1,0 +1,16 @@
+schema_version = 1
+id = "shell_safety"
+version = "0.1.0"
+runtime = ">=0.1,<0.2"
+entrypoint = "plugin:create_plugin"
+execution = "in_process"
+description = "文件工具的额外策略示例"
+dependencies = []
+hooks = ["tool.before"]
+tools = []
+
+[permissions]
+capabilities = []
+
+[resources]
+hook_deadline_seconds = 1.0

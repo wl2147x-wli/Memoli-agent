@@ -497,6 +497,8 @@ memoli_agent/plugins/memory_default/plugin.py
 
 ## 9. SubAgent 阶段（已完成）
 
+当前实现已从早期 one-shot 骨架升级为持久化 Agent Tree + Task DAG：SQLite 是调度事实源，SubAgent 运行完整有界工具循环，支持结构化上下文/结果、独立完整轨迹、依赖解锁、取消、显式恢复和会话隔离管理。默认单并发、单层委派；详细边界见 `docs/systems/subagents.md`。
+
 目标是加入任务委派能力，让主 agent 可以把边界清晰的子任务交给本地子 agent 执行。
 
 目标链路：

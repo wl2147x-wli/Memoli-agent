@@ -29,8 +29,11 @@ enabled = ["memory_default", "shell_safety"]
 [subagent]
 enabled = false
 root = "workspace/benchmark/runtime/subagents"
+database = "workspace/benchmark/runtime/subagents/task-graph.db"
 default_profile = "general"
 max_concurrent = 1
+max_depth = 1
+recovery_policy = "interrupt"
 
 [proactive]
 enabled = false

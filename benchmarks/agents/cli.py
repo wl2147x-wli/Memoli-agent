@@ -8,7 +8,11 @@ import subprocess
 from typing import Any
 
 from benchmarks.config import AgentBenchmarkConfig
-from benchmarks.datasets.base import BenchmarkPrediction, BenchmarkQuestion, BenchmarkSample
+from benchmarks.datasets.base import (
+    BenchmarkPrediction,
+    BenchmarkQuestion,
+    BenchmarkSample,
+)
 
 from .base import prediction_from_payload, question_to_payload, sample_to_payload
 

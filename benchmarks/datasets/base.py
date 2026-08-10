@@ -54,5 +54,4 @@ class BenchmarkPrediction:
 
 
 class DatasetAdapter(Protocol):
-    def load(self) -> list[BenchmarkSample]:
-        ...
+    def load(self) -> list[BenchmarkSample]: ...

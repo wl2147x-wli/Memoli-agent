@@ -12,12 +12,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 
 from memoli_agent.agent.runner import AgentRunner
 from memoli_agent.bus.events import InboundMessage, OutboundMessage
 from memoli_agent.bus.queue import MessageBus
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -26,6 +30,7 @@ class AgentLoop:
 
     bus: MessageBus
     runner: AgentRunner
+    maintenance: Callable[[], Awaitable[object]] | None = None
     _running: bool = False
     _task: asyncio.Task[None] | None = field(default=None, init=False)
 
@@ -60,8 +65,37 @@ class AgentLoop:
 
         while self._running:
             message = await self.bus.consume_inbound()
-            outbound = await self.process(message)
-            await self.bus.publish_outbound(outbound)
+            try:
+                outbound = await self.process(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # 不把原始异常文本回传给用户，避免凭证或路径泄漏。
+                logger.error("单轮处理失败：error_type=%s", type(exc).__name__)
+                outbound = OutboundMessage(
+                    channel=message.channel,
+                    chat_id=message.chat_id,
+                    content="本轮处理失败，请稍后重试。",
+                    metadata={
+                        "status": "error",
+                        "error_type": "turn-processing-failed",
+                        "retryable": True,
+                    },
+                )
+            try:
+                await self.bus.publish_outbound(outbound)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("出站发布失败：error_type=%s", type(exc).__name__)
+            if self.maintenance is not None:
+                try:
+                    await self.maintenance()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # 派生索引维护失败不能终止消息泵；状态保留在 memory job 中。
+                    logger.error("后台维护失败：error_type=%s", type(exc).__name__)
 
     async def process(self, message: InboundMessage) -> OutboundMessage:
         """处理一条入站消息。"""

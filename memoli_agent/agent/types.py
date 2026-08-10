@@ -22,6 +22,7 @@ class ChatMessage:
     tool_call_id: str | None = None
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    blocks: tuple[dict[str, Any], ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转换为 OpenAI-compatible messages 字典。"""
@@ -52,7 +53,9 @@ class ContextRequest:
     turn_state: TurnState
     agent_name: str
     system_prompt: str
+    skill_catalog_prompt_block: str = ""
     memory_prompt_block: str = ""
+    working_prompt_block: str = ""
 
 
 @dataclass(frozen=True, slots=True)

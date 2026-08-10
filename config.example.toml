@@ -2,40 +2,213 @@
 workspace = "workspace"
 
 [llm]
-provider = "openai-compatible"
-model = "gpt-4.1-mini"
-api_key = ""
-base_url = ""
+# 默认示例不联网；正式模型请从下方示例中任选一种替换本段。
+provider = "echo"
+model = "echo"
+stream = false
+
+# OpenAI：
+# provider = "openai"
+# model = "<openai-model-id>"
+# api_key = "${OPENAI_API_KEY}"
+# base_url = "https://api.openai.com/v1"
+# max_retries = 1
+#
+# Anthropic 原生 Messages：
+# provider = "anthropic"
+# model = "<anthropic-model-id>"
+# api_key = "${ANTHROPIC_API_KEY}"
+# base_url = "https://api.anthropic.com"
+#
+# OpenAI-compatible（方言必须显式声明）：
+# provider = "openai-compatible"
+# model = "<compatible-model-id>"
+# api_key = "${MEMOLI_LLM_API_KEY}"
+# base_url = "https://api.deepseek.com/v1"
+# dialect = "deepseek"
+#
+# api_key 也可写成完整环境占位符：
+# api_key = "${MEMOLI_LLM_API_KEY}"
+#
+# 多模型真实 fallback 使用分层写法（启用时删除上面的 [llm] 字段）：
+# [llm.providers.primary]
+# protocol = "anthropic"
+# api_key = "${ANTHROPIC_API_KEY}"
+# base_url = "https://api.anthropic.com"
+#
+# [llm.providers.backup]
+# protocol = "openai"
+# api_key = "${OPENAI_API_KEY}"
+# base_url = "https://api.openai.com/v1"
+#
+# [llm.models.main]
+# provider = "primary"
+# model = "<anthropic-model-id>"
+# capabilities = ["text", "tools", "reasoning", "streaming", "prompt-cache"]
+#
+# [llm.models.fallback]
+# provider = "backup"
+# model = "<openai-model-id>"
+# capabilities = ["text", "tools", "streaming", "structured-output"]
+#
+# [llm.routes]
+# agent = "main"
+# fallback = ["fallback"]
 
 [agent]
 name = "Memoli"
-max_iterations = 8
+max_iterations = 12
+max_elapsed_seconds = 300
+no_progress_limit = 3
 history_window = 20
+
+[trajectory]
+enabled = true
+database = "workspace/trajectories.db"
+capture_content = "redacted"
+max_inline_bytes = 65536
+max_payload_bytes = 4194304
+payload_directory = "workspace/trajectory-payloads"
+sensitive_keys = []
 
 [memory]
 enabled = true
-engine = "markdown"
+engine = "sqlite"
 path = "workspace/memory"
+database = "workspace/memory.db"
+auto_recall = true
+core_card_limit = 8
+core_card_chars = 4000
+recall_limit = 8
+recall_chars = 8000
+consolidation_enabled = false
+legacy_import = "preview"
+max_cjk_ngram = 3
+card_builder_enabled = true
+episode_projection_enabled = true
+maintenance_batch_size = 4
+
+# 语义索引默认关闭；密钥只从指定环境变量读取，不写入 TOML 或 SQLite。
+[memory.embedding]
+enabled = false
+provider = "openai-compatible" # openai-compatible / deterministic / disabled
+model = ""
+version = "1"
+base_url = "https://api.openai.com/v1"
+api_key_env = "MEMOLI_EMBEDDING_API_KEY"
+dimensions = 1536
+timeout_seconds = 30.0
+batch_size = 8
+candidate_limit = 200
+
+[memory.hybrid]
+enabled = true
+rrf_k = 60
+candidate_limit = 50
+keyword_weight = 1.0
+semantic_weight = 1.0
+metadata_weight = 0.5
+card_limit = 2
+claim_limit = 5
+episode_limit = 2
+spillover_order = ["claim", "card", "episode"]
+
+[working_memory]
+enabled = true
+database = "workspace/working-state.db"
+max_chars = 4000
+stale_policy = "mark"
 
 [tools]
-tool_search_enabled = true
+tool_search_enabled = false
+code_runner = "container"
+code_container_cli = "docker"
+# 必须替换为实际构建并固定 digest 的镜像；不可使用 latest。
+code_container_image = "memoli-code-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+code_python_executable = ""
+code_allow_network = false
+code_memory_mb = 256
+code_cpus = 0.5
+code_pids = 64
+code_timeout_seconds = 60
+code_max_output_chars = 10000
+file_read_max_lines = 2000
+file_max_output_chars = 15000
+browser_enabled = false
+subagent_tool_enabled = false
+memory_manage_enabled = false
+
+[skills]
+# 开启后新增只读 skill_load 工具，并按会话注入稳定 Catalog。
+enabled = true
+database = "workspace/skills.db"
+artifact_root = "workspace/skill-artifacts"
+catalog_max_chars = 6000
+skill_max_chars = 15000
+reference_max_chars = 30000
+max_skill_file_bytes = 262144
+max_package_bytes = 2097152
+verify_integrity_on_load = true
+include_unavailable_in_catalog = false
+allow_runtime_management = false
 
 [channels.cli]
 enabled = true
 
 [plugins]
 enabled = ["memory_default", "shell_safety"]
+trusted = ["memory_default", "shell_safety"]
+force_sandbox = []
+hook_deadline_seconds = 2.0
+state_database = "workspace/plugin-state.db"
+system_allowed_capabilities = ["state.get", "state.set", "workspace.read", "workspace.write"]
+
+# 按插件 ID 批准能力；未声明、未批准或未进入系统上限均不可用。
+[plugins.approved_capabilities]
+memory_default = []
+shell_safety = []
+
+[plugins.sandbox]
+container_cli = "docker"
+# 启用沙箱插件前填写 sha256:<image-id> 或 repository@sha256:<digest>，不能使用 latest。
+runner_image = ""
+memory_mb = 256
+cpus = 0.5
+pids = 32
+wall_time_seconds = 30
+max_output_bytes = 1048576
+max_rpc_bytes = 262144
 
 [subagent]
 enabled = true
 root = "workspace/subagents"
+database = "workspace/subagents/task-graph.db"
 default_profile = "general"
-max_concurrent = 2
+max_concurrent = 1
+max_depth = 1
+recovery_policy = "interrupt"
+
+[subagent.profile_max_iterations]
+research = 8
+coding = 10
+general = 8
+
+[subagent.profile_max_elapsed_seconds]
+research = 240.0
+coding = 300.0
+general = 240.0
 
 [proactive]
 enabled = false
 interval_seconds = 60
+run_on_start = false
+# 留空时首次等待 interval_seconds；配置时必须大于 0。
+# initial_delay_seconds = 60
 cooldown_seconds = 300
+# 可选免打扰时段，开始/结束必须同时配置；跨午夜写法如 22 到 7。
+# quiet_hours_start = 22
+# quiet_hours_end = 7
+quiet_hours_timezone = "Asia/Shanghai"
 chat_id = "local"
 message = "这是一次主动检查。"
 

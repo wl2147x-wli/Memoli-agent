@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import random
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 from benchmarks.config import DatasetConfig
 from benchmarks.datasets.base import (
@@ -54,7 +54,11 @@ class LongMemEvalDatasetAdapter:
 
         sessions = []
         for s_index, turns in enumerate(raw_sessions):
-            session_id = str(session_ids[s_index]) if s_index < len(session_ids) else f"session_{s_index}"
+            session_id = (
+                str(session_ids[s_index])
+                if s_index < len(session_ids)
+                else f"session_{s_index}"
+            )
             timestamp = str(dates[s_index]) if s_index < len(dates) else ""
             messages = []
             for t_index, turn in enumerate(turns):
@@ -157,7 +161,11 @@ def _filter_questions(
 ) -> list[BenchmarkSample]:
     if not question_types:
         return samples
-    return [s for s in samples if s.questions and s.questions[0].question_type in question_types]
+    return [
+        sample
+        for sample in samples
+        if sample.questions and sample.questions[0].question_type in question_types
+    ]
 
 
 def _sample(

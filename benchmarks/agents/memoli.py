@@ -33,9 +33,15 @@ class MemoliAgentAdapter:
         self.sample_workspace: Path | None = None
 
     async def reset(self, sample_id: str) -> None:
+        if self.runtime is not None:
+            await self.runtime.shutdown()
         workspace_root = Path(self.config.workspace_root)
-        sample_workspace = workspace_root / self.dataset_name / self.split / _safe_id(sample_id)
-        reset_enabled = self.config.reset_memory_per_sample and self.config.reset_per_sample
+        sample_workspace = (
+            workspace_root / self.dataset_name / self.split / _safe_id(sample_id)
+        )
+        reset_enabled = (
+            self.config.reset_memory_per_sample and self.config.reset_per_sample
+        )
         if reset_enabled and sample_workspace.exists():
             _safe_rmtree(sample_workspace, workspace_root)
         sample_workspace.mkdir(parents=True, exist_ok=True)
@@ -44,6 +50,8 @@ class MemoliAgentAdapter:
         app_config = _with_sample_paths(app_config, sample_workspace)
         app_config.channels.cli.enabled = False
         self.runtime = build_app_runtime(app_config)
+        # benchmark 也走完整生命周期，保证 SQLite 轨迹等资源已经就绪。
+        await self.runtime.start()
         self.sample_workspace = sample_workspace
 
     async def ingest(self, sample: BenchmarkSample) -> None:
@@ -131,18 +139,21 @@ class MemoliAgentAdapter:
         )
 
     async def close(self) -> None:
+        if self.runtime is not None:
+            await self.runtime.shutdown()
         self.runtime = None
         self.sample_workspace = None
 
     def _runtime(self) -> AppRuntime:
         if self.runtime is None:
-            raise RuntimeError("MemoliAgentAdapter.reset(sample_id) must be called first.")
+            raise RuntimeError(
+                "MemoliAgentAdapter.reset(sample_id) must be called first."
+            )
         return self.runtime
 
 
 def _with_sample_paths(config: AppConfig, sample_workspace: Path) -> AppConfig:
-    # AppConfig is mutable, but replace top-level sections to avoid sharing nested objects
-    # if a caller reuses the loaded config object.
+    # AppConfig 可变；替换顶层配置，避免调用方复用时共享嵌套对象。
     config = replace(config)
     config.runtime = replace(config.runtime, workspace=str(sample_workspace))
     config.memory = replace(config.memory, path=str(sample_workspace / "memory"))
@@ -159,7 +170,8 @@ def _render_message(sample_id: str, session_id: str, message: BenchmarkMessage) 
 
 
 def _safe_id(value: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)[:120]
+    safe = (ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+    return "".join(safe)[:120]
 
 
 def _safe_rmtree(target: Path, root: Path) -> None:

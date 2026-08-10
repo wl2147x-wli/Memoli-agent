@@ -12,14 +12,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 
 def utc_now() -> datetime:
     """返回带时区的 UTC 时间。"""
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class Session:
 
     session_key: str
     history_window: int
+    session_instance_id: str = field(default_factory=lambda: uuid4().hex)
     _history: list[SessionMessage] = field(default_factory=list)
 
     def add_user_message(

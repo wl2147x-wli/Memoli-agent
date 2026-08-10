@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from memoli_agent.agent.core.results import TurnResult
 from memoli_agent.agent.memory.runtime import MemoryQueryResult
 from memoli_agent.agent.provider import LLMResponse
 from memoli_agent.agent.session import Session
@@ -26,9 +27,14 @@ class PassiveTurnContext:
     context_result: ContextRenderResult | None = None
     memory_query_result: MemoryQueryResult | None = None
     memory_prompt_block: str = ""
+    skill_catalog_prompt_block: str = ""
+    working_prompt_block: str = ""
     llm_response: LLMResponse | None = None
+    turn_result: TurnResult | None = None
     outbound: OutboundMessage | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    trace_id: str = ""
+    root_span_id: str = ""
 
 
 BeforeTurnContext = PassiveTurnContext

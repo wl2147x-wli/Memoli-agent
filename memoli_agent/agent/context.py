@@ -3,9 +3,10 @@
 ContextBuilder 负责把一轮输入变成模型可消费的 messages：
 
 1. system prompt
-2. 可选长期记忆 prompt block
-3. 当前 session 的历史消息
-4. 当前用户消息
+2. 可选、会话稳定的 Skill Catalog
+3. 可选长期记忆 prompt block
+4. 当前 session 的历史消息
+5. 当前用户消息
 
 当前阶段还不调用真实 LLM，但先把结构稳定下来，后续 provider 可以直接复用。
 """
@@ -29,12 +30,22 @@ class ContextBuilder:
 
         messages = [ChatMessage(role="system", content=request.system_prompt)]
 
+        if request.skill_catalog_prompt_block:
+            messages.append(
+                ChatMessage(role="system", content=request.skill_catalog_prompt_block)
+            )
+
         if request.memory_prompt_block:
             messages.append(
                 ChatMessage(
                     role="system",
                     content=request.memory_prompt_block,
                 )
+            )
+
+        if request.working_prompt_block:
+            messages.append(
+                ChatMessage(role="system", content=request.working_prompt_block)
             )
 
         for history_message in request.turn_state.session.get_history():

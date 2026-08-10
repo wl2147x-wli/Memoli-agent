@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from memoli_agent.agent.proactive.state import ProactiveSignal, ProactiveState
@@ -23,7 +23,7 @@ class ProactiveSensor:
         """读取当前最小状态并生成主动信号。"""
 
         return ProactiveSignal(
-            now=datetime.now(timezone.utc),
+            now=datetime.now(UTC),
             tick_count=state.tick_count,
             metadata={
                 "memory_enabled": self.memory_runtime is not None,

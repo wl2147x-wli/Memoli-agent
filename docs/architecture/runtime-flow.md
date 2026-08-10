@@ -12,15 +12,15 @@ flowchart TD
 
     D["bus/queue.py<br/>MessageBus<br/>维护 inbound/outbound 两个异步队列，连接 channel 和 agent。"]
     E["bootstrap/tools.py<br/>工具装配<br/>创建 ToolRegistry，并注册第一批内置工具。"]
-    F["agent/core/reasoner.py<br/>Reasoner<br/>调用模型 provider；如模型返回 tool_calls，则执行一轮工具调用。"]
+    F["agent/core/reasoner.py<br/>Reasoner<br/>在预算内串行执行多轮模型与工具调用。"]
     G["agent/session.py<br/>SessionManager<br/>按 session_key 管理多轮对话历史。"]
     H["agent/context.py<br/>ContextBuilder<br/>把 system prompt、历史消息、当前用户输入组装成 messages。"]
 
-    E1["agent/tools/builtin.py<br/>内置工具集合<br/>提供 time、calculator、memory、filesystem 等基础工具。"]
+    E1["agent/tools/*<br/>极简工具集合<br/>提供代码、文件、checkpoint、用户控制、时间和记忆检索。"]
     E2["time<br/>时间工具<br/>返回当前本地时间和 UTC 时间。"]
-    E3["calculator<br/>计算工具<br/>使用 AST 白名单安全计算基础数学表达式。"]
-    E4["memory_write / memory_recall<br/>临时记忆工具<br/>在当前进程内写入和检索临时记忆，尚不是长期记忆系统。"]
-    E5["filesystem_read<br/>文件读取工具<br/>只允许读取 workspace 目录内的 UTF-8 文本文件。"]
+    E3["code_run<br/>通用执行工具<br/>通过有超时和输出上限的子进程执行 Python 或 PowerShell。"]
+    E4["checkpoint / ask_user<br/>控制工具<br/>保存短期任务状态或以 needs-user 暂停。"]
+    E5["file_read / file_patch / file_write<br/>文件工具<br/>只操作 workspace 内 UTF-8 普通文件。"]
 
     P["agent/provider.py<br/>LLMProvider 抽象<br/>统一 EchoProvider 与 OpenAI-compatible provider 的 chat 接口。"]
     P1["EchoProvider<br/>本地测试 provider<br/>无 API key 时默认使用，返回 Echo: 用户输入。"]
@@ -38,7 +38,7 @@ flowchart TD
 
     Q["consume_inbound<br/>消费入站消息<br/>AgentLoop 从 MessageBus 取出用户消息。"]
     R["BeforeTurnPhase<br/>准备会话阶段<br/>根据 session_key 获取 Session，并创建 TurnState。"]
-    S["BeforeReasoningPhase<br/>推理前阶段<br/>当前是扩展点，后续可注入工具上下文、记忆、技能等。"]
+    S["BeforeReasoningPhase<br/>推理前阶段<br/>召回个人记忆并准备动态上下文。"]
     T["PromptRenderPhase<br/>Prompt 渲染阶段<br/>调用 ContextBuilder 生成模型可用的 messages。"]
     U["ReasonerPhase<br/>推理阶段<br/>调用 Reasoner，让模型生成回复或请求工具调用。"]
     V["AfterReasoningPhase<br/>推理后阶段<br/>把用户输入和助手回复写入 Session 历史。"]
@@ -169,6 +169,7 @@ sequenceDiagram
 | Runtime 装配中心 | `bootstrap/app.py` | 创建并连接整个 agent 所需对象，是项目启动时的总装配点。 |
 | 通道装配 | `bootstrap/channels.py` | 根据配置启动 CLI 通道，后续可扩展 IPC、WebSocket 等通道。 |
 | 工具装配 | `bootstrap/tools.py` | 创建 `ToolRegistry`，注册当前阶段的内置工具。 |
+| Skill 装配 | `bootstrap/skills.py` | 打开版本化 Registry、安装 builtin 示例并提供 Session Catalog/Loader。 |
 | 消息类型 | `bus/events.py` | 定义 `InboundMessage` 和 `OutboundMessage`。 |
 | 消息总线 | `bus/queue.py` | 使用两个 `asyncio.Queue` 管理入站和出站消息。 |
 | CLI 通道 | `channels/cli.py` | 负责终端输入输出，把用户文本变成入站消息，把 agent 回复打印出来。 |
@@ -181,12 +182,13 @@ sequenceDiagram
 | 会话管理 | `agent/session.py` | 按 `session_key` 保存多轮会话历史。 |
 | 上下文构建 | `agent/context.py` | 把 system prompt、历史消息和当前用户消息组装成 messages。 |
 | Prompt block | `agent/core/prompt_blocks.py` | 构建基础 system prompt。 |
-| 推理器 | `agent/core/reasoner.py` | 调用模型 provider，并执行一轮 tool call。 |
+| 推理器 | `agent/core/reasoner.py` | 在预算内调用模型并串行执行多轮 tool call。 |
 | 模型接口 | `agent/provider.py` | 定义 EchoProvider 和 OpenAI-compatible provider。 |
 | 工具协议 | `agent/tools/base.py` | 定义工具接口、工具结果和工具错误。 |
 | 工具注册表 | `agent/tools/registry.py` | 注册工具、导出 schema、执行工具。 |
-| 内置工具 | `agent/tools/builtin.py` | 提供 time、calculator、临时 memory、filesystem_read 等工具。 |
-| 工具搜索 | `agent/tools/tool_search.py` | 按工具名和描述进行最小关键词搜索。 |
+| GenericAgent 风格工具 | `agent/tools/generic.py` | 提供 code_run、file_read、file_patch 和 file_write。 |
+| 控制工具 | `agent/tools/control.py` | 提供 working checkpoint、ask_user 和长期整理请求。 |
+| 浏览器工具 | `agent/tools/browser.py` | 定义可选的 web_scan/web_execute_js adapter 边界。 |
 
 ## 四、第六阶段后的主链路总结
 
@@ -208,4 +210,25 @@ sequenceDiagram
   -> CLI 打印回复
 ```
 
-当前阶段的关键变化是：模型不再只能直接生成文本，也可以通过 `tool_calls` 请求调用工具。`Reasoner` 会执行一轮工具调用，并把工具结果交回模型生成最终回复。
+模型可以通过 `tool_calls` 请求工具。`Reasoner` 按声明顺序执行工具，把结果交回
+模型并在预算内继续下一次决策，直到完成、需要用户、失败或耗尽预算。
+
+## 五、记忆检索与派生维护链路
+
+```text
+BeforeReasoning
+  -> 用户主查询 + working objective/current-step + session/scope
+  -> Keyword / Semantic(可选) / Metadata lanes
+  -> 硬过滤 -> RRF -> 类型与字符预算
+  -> memory_retrieved 诊断事件 -> PromptRender
+
+Reasoner 提交 trace_finished
+  -> AfterTurn 使用已提交 trajectory 投影 Episode
+  -> 先发布 OutboundMessage
+  -> AgentLoop 空闲点串行 tick Card Builder 与 semantic index worker
+```
+
+维护 tick 不创建并发 agent turn。Embedding、Card 或 Episode 派生失败只更新有界
+诊断/重试状态，不回滚已提交轨迹、Claim 或用户可见回复。三类数据库仍保持边界：
+`working-state.db` 保存短期任务状态，`trajectories.db` 保存原始运行证据，
+`memory.db` 保存长期事实和可重建检索投影。

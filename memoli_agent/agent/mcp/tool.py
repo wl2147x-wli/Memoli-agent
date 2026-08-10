@@ -26,7 +26,9 @@ class MCPToolAdapter:
     def description(self) -> str:
         """工具描述。"""
 
-        return self.spec.description or f"MCP 工具：{self.spec.server_name}.{self.spec.name}"
+        return self.spec.description or (
+            f"MCP 工具：{self.spec.server_name}.{self.spec.name}"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from memoli_agent.agent.memory.runtime import MemoryQuery, MemoryQueryResult
+from memoli_agent.agent.memory.sqlite_store import SQLiteMemoryStore
 from memoli_agent.agent.memory.store import MarkdownMemoryStore
 
 
@@ -32,6 +33,16 @@ class KeywordMemoryRetriever:
                 matches.append(item)
 
         return MemoryQueryResult(items=matches[: request.limit])
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteMemoryRetriever:
+    """使用 FTS5，并由 store 自动降级为有界关键词检索。"""
+
+    store: SQLiteMemoryStore
+
+    def query(self, request: MemoryQuery) -> MemoryQueryResult:
+        return self.store.search(request)
 
 
 def _split_keywords(query: str) -> list[str]:

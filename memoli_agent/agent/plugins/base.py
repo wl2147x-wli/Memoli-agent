@@ -1,48 +1,48 @@
-"""插件基础协议。
-
-第八阶段只实现本地 Python 插件，不做热加载、隔离进程或依赖安装。
-"""
+"""插件公共协议与元数据。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from enum import StrEnum
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from memoli_agent.agent.plugins.context import PluginRuntimeContext
+    from memoli_agent.agent.plugins.registrar import PluginRegistrar
 
 
-@dataclass(frozen=True, slots=True)
-class PluginMeta:
-    """插件元信息。"""
+class PluginExecutionMode(StrEnum):
+    """插件执行模式。"""
 
-    name: str
-    version: str = "0.1.0"
-    description: str = ""
+    IN_PROCESS = "in_process"
+    SANDBOX = "sandbox"
 
 
 @dataclass(frozen=True, slots=True)
 class PluginLoadResult:
-    """插件加载结果。"""
+    """插件加载或激活结果。"""
 
     name: str
     success: bool
+    stage: str = "load"
     error: str = ""
+    backend: str = ""
 
 
 class Plugin(Protocol):
-    """插件协议。"""
+    """进程内与沙箱 runner 共同遵守的插件协议。"""
 
-    name: str
-
-    async def initialize(self, context: object) -> None:
-        """初始化插件。"""
+    def register(self, registrar: PluginRegistrar) -> None:
+        """声明 hooks、工具或其他贡献。"""
 
         ...
 
-    async def terminate(self, context: object) -> None:
-        """关闭插件。"""
+    async def initialize(self, context: PluginRuntimeContext) -> None:
+        """在贡献提交前完成运行期初始化。"""
 
         ...
 
-    def register(self, context: object) -> None:
-        """注册工具、hooks 或其他扩展。"""
+    async def terminate(self) -> None:
+        """释放插件自身资源。"""
 
         ...

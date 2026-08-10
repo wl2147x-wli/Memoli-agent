@@ -1,0 +1,16 @@
+schema_version = 1
+id = "memory_default"
+version = "0.1.0"
+runtime = ">=0.1,<0.2"
+entrypoint = "plugin:create_plugin"
+execution = "in_process"
+description = "不改变行为的记忆 Observer 示例"
+dependencies = []
+hooks = ["turn.after"]
+tools = []
+
+[permissions]
+capabilities = []
+
+[resources]
+hook_deadline_seconds = 1.0

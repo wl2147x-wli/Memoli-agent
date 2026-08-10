@@ -30,7 +30,8 @@ class ReportWriter:
 
     def write_metrics(self, metrics: dict[str, Any]) -> Path:
         path = self.output_dir / "metrics.json"
-        path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        content = json.dumps(metrics, ensure_ascii=False, indent=2)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def write_interface_schema(self) -> Path:
@@ -62,7 +63,8 @@ class ReportWriter:
             "",
             f"- total_questions: `{metrics.get('total_questions')}`",
             f"- overall score: `{metrics.get('overall', {}).get('score')}`",
-            f"- retrieval recall: `{metrics.get('overall', {}).get('retrieval_recall')}`",
+            "- retrieval recall: "
+            f"`{metrics.get('overall', {}).get('retrieval_recall')}`",
             "",
         ]
         if provider_warning:
@@ -156,9 +158,13 @@ class BenchmarkAgentAdapter:
 ```python
 BenchmarkMessage(id, role, speaker, content, timestamp, metadata)
 BenchmarkSession(id, messages, timestamp, metadata)
-BenchmarkQuestion(id, question, gold_answers, timestamp, question_type, evidence, metadata)
+BenchmarkQuestion(
+    id, question, gold_answers, timestamp, question_type, evidence, metadata
+)
 BenchmarkSample(id, sessions, questions, metadata)
-BenchmarkPrediction(sample_id, question_id, prediction, gold_answers, retrieved_context, metadata)
+BenchmarkPrediction(
+    sample_id, question_id, prediction, gold_answers, retrieved_context, metadata
+)
 ```
 
 ## ingest 输入格式
@@ -251,7 +257,8 @@ HTTP / CLI adapter 期望 Agent 返回 JSON object：
 
 ## metrics.json
 
-包含 `dataset`、`split`、`metric_source`、`total_samples`、`total_questions`、`overall`、`by_question_type` 和 `config`。
+包含 `dataset`、`split`、`metric_source`、`total_samples`、
+`total_questions`、`overall`、`by_question_type` 和 `config`。
 
 ## LoCoMo official qa 重组格式
 
@@ -268,7 +275,9 @@ LoCoMo 官方脚本接收的每个 QA：
 }
 ```
 
-`score` 和 `retrieval_recall` 来自 `D:/wli/project1/locomo/task_eval/evaluation.py` 的 `eval_question_answering()`。
+`score` 和 `retrieval_recall` 来自
+`D:/wli/project1/locomo/task_eval/evaluation.py` 的
+`eval_question_answering()`。
 
 ## LongMemEval official_hypotheses.jsonl
 

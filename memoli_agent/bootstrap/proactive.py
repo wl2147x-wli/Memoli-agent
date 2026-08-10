@@ -27,7 +27,12 @@ def build_proactive_loop(
         decision=ProactiveDecision(
             cooldown_seconds=config.proactive.cooldown_seconds,
             message=config.proactive.message,
+            quiet_hours_start=config.proactive.quiet_hours_start,
+            quiet_hours_end=config.proactive.quiet_hours_end,
+            quiet_hours_timezone=config.proactive.quiet_hours_timezone,
         ),
         interval_seconds=config.proactive.interval_seconds,
+        run_on_start=config.proactive.run_on_start,
+        initial_delay_seconds=config.proactive.initial_delay_seconds,
         chat_id=config.proactive.chat_id,
     )

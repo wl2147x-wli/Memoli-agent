@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from memoli_agent.agent.tools.base import ToolResult
@@ -51,18 +51,24 @@ class MCPClient:
             ) from exc
 
         exit_stack = AsyncExitStack()
-        server_params = StdioServerParameters(
-            command=self.config.command,
-            args=list(self.config.args),
-            env=dict(self.config.env) or None,
-        )
-        read_stream, write_stream = await exit_stack.enter_async_context(
-            stdio_client(server_params)
-        )
-        session = await exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
-        await session.initialize()
+        try:
+            server_params = StdioServerParameters(
+                command=self.config.command,
+                args=list(self.config.args),
+                env=dict(self.config.env) or None,
+            )
+            read_stream, write_stream = await exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            session = await exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
+        except BaseException:
+            # 初始化完成前资源只属于局部 stack，任何失败都必须立即释放。
+            with suppress(Exception):
+                await exit_stack.aclose()
+            raise
 
         self._session = session
         self._exit_stack = exit_stack
@@ -105,7 +111,7 @@ class MCPClient:
             )
         except Exception as exc:
             return ToolResult(
-                content=f"MCP 工具调用失败：{exc}",
+                content="MCP 工具调用失败。",
                 success=False,
                 metadata={
                     "server": self.config.name,
@@ -158,7 +164,7 @@ def _read_input_schema(tool: Any) -> dict[str, Any]:
         schema = getattr(tool, "input_schema", None)
     if isinstance(schema, dict):
         return schema
-    if hasattr(schema, "model_dump"):
+    if schema is not None and hasattr(schema, "model_dump"):
         dumped = schema.model_dump()
         if isinstance(dumped, dict):
             return dumped

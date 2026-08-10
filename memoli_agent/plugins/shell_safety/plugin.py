@@ -1,53 +1,45 @@
-"""Shell 安全插件。
-
-当前项目还没有 shell 工具，因此本插件先保护 filesystem_read。
-"""
+"""工具策略插件示例；核心工具自身仍是不可绕过的安全边界。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Any
 
-from memoli_agent.agent.plugins.context import PluginContext
+from memoli_agent.agent.plugins.context import PluginRuntimeContext
+from memoli_agent.agent.plugins.events import HookName, ToolBeforeEvent, ToolDecision
+from memoli_agent.agent.plugins.registrar import PluginRegistrar
 
 
 @dataclass(frozen=True, slots=True)
 class ShellSafetyPlugin:
-    """基础安全插件。"""
+    """额外拒绝文件工具访问隐藏路径；不替代核心 WorkspacePathResolver。"""
 
-    name: str = "shell_safety"
+    def register(self, registrar: PluginRegistrar) -> None:
+        registrar.add_policy(HookName.TOOL_BEFORE, self._tool_before)
 
-    async def initialize(self, context: PluginContext) -> None:
-        """初始化插件。"""
+    async def initialize(self, context: PluginRuntimeContext) -> None:
+        del context
 
-    async def terminate(self, context: PluginContext) -> None:
-        """关闭插件。"""
+    async def terminate(self) -> None:
+        return None
 
-    def register(self, context: PluginContext) -> None:
-        """注册工具执行前检查。"""
-
-        context.hook_registry.register_tool_pre(self._tool_pre)
-
-    def _tool_pre(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """检查危险工具参数。"""
-
-        if tool_name != "filesystem_read":
-            return arguments
-
-        raw_path = str(arguments.get("path", ""))
+    def _tool_before(self, event: ToolBeforeEvent) -> ToolDecision:
+        protected_tools = {
+            "file_read",
+            "file_write",
+            "file_patch",
+            "filesystem_read",
+        }
+        if event.tool_name not in protected_tools:
+            return ToolDecision.allow()
+        raw_path = str(event.arguments.get("path", ""))
         path = PurePath(raw_path)
-        dangerous_parts = {"..", "~"}
-        if path.is_absolute() or any(part in dangerous_parts for part in path.parts):
-            raise PermissionError("filesystem_read 只允许读取 workspace 内相对路径。")
-
+        if path.is_absolute() or ".." in path.parts or "~" in path.parts:
+            return ToolDecision.deny("文件工具只允许 workspace 内相对路径。")
         if any(part.startswith(".") for part in path.parts):
-            raise PermissionError("filesystem_read 不允许读取隐藏路径。")
-
-        return arguments
+            return ToolDecision.deny("文件工具不允许访问隐藏路径。")
+        return ToolDecision.allow()
 
 
 def create_plugin() -> ShellSafetyPlugin:
-    """创建插件实例。"""
-
     return ShellSafetyPlugin()

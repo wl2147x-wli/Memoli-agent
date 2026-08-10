@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_LOCOMO_EVAL_SCRIPT = "D:/wli/project1/locomo/task_eval/evaluation.py"
 
 
@@ -27,7 +26,8 @@ def evaluate_locomo_official(
     if len(scores) != len(records) or len(recalls) != len(records):
         raise RuntimeError(
             "LoCoMo official evaluator returned a different number of scores "
-            f"({len(scores)}) or recalls ({len(recalls)}) than records ({len(records)})."
+            f"({len(scores)}) or recalls ({len(recalls)}) than records "
+            f"({len(records)})."
         )
 
     for record, qa, score, recall in zip(records, qas, scores, recalls, strict=True):
@@ -116,5 +116,7 @@ def _category_from_question_type(question_type: str | None) -> int:
         "adversarial": 5,
     }
     if question_type not in mapping:
-        raise ValueError(f"Cannot infer LoCoMo category from question_type={question_type!r}")
+        raise ValueError(
+            f"Cannot infer LoCoMo category from question_type={question_type!r}"
+        )
     return mapping[question_type]

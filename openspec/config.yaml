@@ -1,0 +1,40 @@
+schema: spec-driven
+context: |
+  Memoli-agent is a Python 3.11+ memory-focused, extensible agent runtime.
+  The runtime uses asyncio, standard-library HTTP/TOML support, and the MCP Python SDK.
+  Its main boundaries are bootstrap composition, message/event buses, channels, bounded
+  multi-step turns, providers, GenericAgent-style tools, SQLite trajectory, evidence-backed
+  SQLite personal memory, working state, plugins, SubAgents, proactive tasks, MCP clients,
+  and the standalone benchmark harness. Markdown memory is a legacy migration input only.
+
+  openspec/specs is the source of truth for current observable behavior. docs/ contains
+  architecture, implementation background, and operational guidance; keep it consistent
+  with specs without copying implementation detail into behavioral requirements.
+
+  Development commands:
+  - python -m pytest -q
+  - python -m ruff check memoli_agent benchmarks tests
+  - python -m pyright
+
+  Conventions:
+  - Use type annotations and dataclasses for data contracts.
+  - Keep main.py thin and compose dependencies in memoli_agent/bootstrap/.
+  - Preserve async boundaries for I/O and runtime lifecycle operations.
+  - Keep channels, providers, tools, memory, plugins, and benchmark adapters replaceable.
+  - Do not commit config.toml, .env, workspace/, logs/, secrets, or generated reports.
+  - User-facing documentation and specs are written in Chinese; code identifiers remain English.
+
+rules:
+  proposal:
+    - State the user-visible problem, intended behavior, affected capabilities, and non-goals.
+    - Identify compatibility, persistence, security, and migration impact when applicable.
+  specs:
+    - Describe observable contracts rather than Python classes or implementation steps.
+    - Include happy-path and relevant failure, disabled-state, or boundary scenarios.
+    - Use SHALL for required behavior and make every scenario verifiable.
+  design:
+    - Record cross-module data flow, lifecycle changes, alternatives, and rollback concerns.
+    - Explain changes to configuration, stored files, public tool schemas, or adapter protocols.
+  tasks:
+    - Include implementation, automated tests, OpenSpec validation, and documentation sync.
+    - Keep each checkbox independently verifiable and order tasks by dependency.

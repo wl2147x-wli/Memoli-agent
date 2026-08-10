@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 from pathlib import Path
 
 from benchmarks.config import load_benchmark_config
@@ -22,7 +22,13 @@ def test_echo_dry_run_writes_outputs(tmp_path: Path) -> None:
                     "haystack_dates": ["2023/01/01 10:00"],
                     "haystack_session_ids": ["s1"],
                     "haystack_sessions": [
-                        [{"role": "user", "content": "Alice likes tea.", "has_answer": True}]
+                        [
+                            {
+                                "role": "user",
+                                "content": "Alice likes tea.",
+                                "has_answer": True,
+                            }
+                        ]
                     ],
                     "answer_session_ids": ["s1"],
                 }
@@ -97,4 +103,7 @@ save_report = true
     assert (result_dir / "report.md").exists()
     assert (result_dir / "interface_schema.md").exists()
     assert (result_dir / "official_hypotheses.jsonl").exists()
-    assert (workspace_root / "longmemeval" / "test" / "q1" / "memory" / "MEMORY.md").exists()
+    memory_file = (
+        workspace_root / "longmemeval" / "test" / "q1" / "memory" / "MEMORY.md"
+    )
+    assert memory_file.exists()

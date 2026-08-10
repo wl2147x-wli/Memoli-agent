@@ -6,7 +6,11 @@ import importlib
 from typing import Any
 
 from benchmarks.config import AgentBenchmarkConfig
-from benchmarks.datasets.base import BenchmarkPrediction, BenchmarkQuestion, BenchmarkSample
+from benchmarks.datasets.base import (
+    BenchmarkPrediction,
+    BenchmarkQuestion,
+    BenchmarkSample,
+)
 
 from .base import maybe_await
 

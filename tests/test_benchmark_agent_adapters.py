@@ -155,7 +155,8 @@ def test_http_agent_adapter_posts_reset_ingest_answer() -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        host, port = server.server_address
+        host = str(server.server_address[0])
+        port = int(server.server_address[1])
         adapter = create_agent_adapter(
             AgentBenchmarkConfig(type="http", base_url=f"http://{host}:{port}"),
             dataset_name="locomo",

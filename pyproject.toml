@@ -5,8 +5,14 @@ description = "A memory-focused extensible agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "anthropic>=0.121,<1",
   "mcp>=1.27,<2",
+  "openai>=2.44,<3",
+  "PyYAML>=6.0,<7",
 ]
+
+[project.scripts]
+memoli-skills = "memoli_agent.skills_cli:main"
 authors = [
   { name = "Memoli-agent contributors" }
 ]
@@ -33,3 +39,7 @@ ignore = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "container: requires a reachable Docker daemon and prebuilt immutable runner image",
+  "provider_live: requires explicit real-provider credentials and network access",
+]

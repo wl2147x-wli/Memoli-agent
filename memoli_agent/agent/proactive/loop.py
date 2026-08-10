@@ -25,6 +25,8 @@ class ProactiveLoop:
     sensor: ProactiveSensor
     decision: ProactiveDecision
     interval_seconds: int = 60
+    run_on_start: bool = False
+    initial_delay_seconds: float | None = None
     chat_id: str = "local"
     state: ProactiveState = field(default_factory=ProactiveState)
     _running: bool = False
@@ -53,9 +55,22 @@ class ProactiveLoop:
     async def run(self) -> None:
         """定时执行主动检查。"""
 
+        if self.run_on_start:
+            await self._tick()
+        else:
+            delay = (
+                self.interval_seconds
+                if self.initial_delay_seconds is None
+                else self.initial_delay_seconds
+            )
+            await asyncio.sleep(max(0, delay))
+            if self._running:
+                await self._tick()
+
         while self._running:
             await asyncio.sleep(max(1, self.interval_seconds))
-            await self._tick()
+            if self._running:
+                await self._tick()
 
     async def _tick(self) -> None:
         """执行一次主动检查。"""

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from memoli_agent.agent.mcp.client import MCPClient, MCPToolSpec
 from memoli_agent.agent.mcp.tool import MCPToolAdapter
 from memoli_agent.agent.tools.registry import ToolRegistry
 from memoli_agent.bootstrap.config import MCPServerConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +37,9 @@ class MCPClientManager:
 
         self.connect_results.clear()
         self.tool_specs.clear()
+        if self.clients:
+            await self.close_all()
+        registered_names: dict[str, tuple[str, str]] = {}
         for config in self.server_configs:
             if not config.enabled:
                 continue
@@ -42,19 +48,44 @@ class MCPClientManager:
             try:
                 await client.connect()
                 specs = await client.list_tools()
+                discovered_names = dict(registered_names)
+                for spec in specs:
+                    previous = discovered_names.get(spec.registered_name)
+                    current = (spec.server_name, spec.name)
+                    if previous is not None and previous != current:
+                        raise ValueError(
+                            "MCP 工具规范名冲突："
+                            f"{previous[0]}.{previous[1]} 与 "
+                            f"{current[0]}.{current[1]} -> {spec.registered_name}"
+                        )
+                    discovered_names[spec.registered_name] = current
             except Exception as exc:
-                await client.close()
+                await self._close_client(client)
+                await self.close_all()
+                self.connect_results = [
+                    MCPConnectResult(
+                        result.server_name,
+                        False,
+                        "MCP 初始化因后续 server 失败已回滚。",
+                    )
+                    for result in self.connect_results
+                ]
                 self.connect_results.append(
                     MCPConnectResult(
                         server_name=config.name,
                         success=False,
-                        message=str(exc),
+                        message=(
+                            str(exc)
+                            if isinstance(exc, ValueError)
+                            else f"连接失败：{type(exc).__name__}"
+                        ),
                     )
                 )
-                continue
+                break
 
             self.clients[config.name] = client
             self.tool_specs.extend(specs)
+            registered_names = discovered_names
             self.connect_results.append(
                 MCPConnectResult(
                     server_name=config.name,
@@ -78,7 +109,17 @@ class MCPClientManager:
     async def close_all(self) -> None:
         """关闭所有 MCP client。"""
 
-        for client in list(self.clients.values()):
-            await client.close()
+        clients = list(self.clients.values())
         self.clients.clear()
         self.tool_specs.clear()
+        for client in clients:
+            await self._close_client(client)
+
+    @staticmethod
+    async def _close_client(client: MCPClient) -> None:
+        """关闭单个 client；一个关闭错误不能跳过其他资源清理。"""
+
+        try:
+            await client.close()
+        except Exception as exc:
+            logger.warning("MCP client 关闭失败：error_type=%s", type(exc).__name__)

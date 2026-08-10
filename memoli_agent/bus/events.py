@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -22,7 +22,7 @@ def utc_now() -> datetime:
     使用 timezone-aware datetime，避免后续跨时区和持久化时出现歧义。
     """
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)

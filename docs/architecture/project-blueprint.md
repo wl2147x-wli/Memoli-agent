@@ -295,9 +295,9 @@ messages + tool schemas
 system prompt
   identity
   behavior rules
-  memory block
-  tool instructions
-  skill instructions
+skill catalog（启用时，会话固定）
+memory block（动态）
+working state（动态）
 
 history
 context frame
@@ -305,6 +305,12 @@ current user message
 ```
 
 不要让各个模块直接拼 prompt。统一走 `ContextBuilder`。
+
+当前 Skill 架构由 `SQLiteSkillRepository -> Session snapshot -> Catalog ->
+skill_load -> 通用工具` 组成。Registry 管理不可变版本、active/previous 指针、撤销和
+审计；模型没有安装、激活或修改 Skill 的工具。该设计对应 GenericAgent 的紧凑目录
+注入和按需 SOP 全文注入，但增加了版本固定、完整性校验、SubAgent allowlist 过滤及
+trajectory 领域事件。Working State 的 `related_sop` 保持非权威提示，不参与发布。
 
 ### 8. agent/provider.py
 
@@ -397,6 +403,8 @@ class Plugin:
 ```
 
 ### 12. subagent/
+
+当前 SubAgent 架构由 `TaskGraphRepository -> SubAgentManager/Scheduler -> SubAgentRuntimeFactory -> Reasoner` 组成。SQLite 同时保存 Agent Tree 身份、Task DAG、状态日志、控制消息、attempt 与 artifact 索引；`task.json` 和 `result.md` 只是可重建的调试视图。每个任务使用独立上下文、working state 和受 profile 限制的 ToolRegistry，主 Agent 是唯一用户输出边界。
 
 subagent 建议从一开始就按“工具接入 + 内部事件回流”的思路设计。
 

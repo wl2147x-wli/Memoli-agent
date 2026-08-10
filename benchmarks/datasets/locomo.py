@@ -15,7 +15,6 @@ from benchmarks.datasets.base import (
     BenchmarkSession,
 )
 
-
 CATEGORY_TO_TYPE = {
     1: "multi-hop",
     2: "temporal",
