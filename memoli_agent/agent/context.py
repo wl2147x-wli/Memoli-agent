@@ -5,10 +5,12 @@ ContextBuilder 负责把一轮输入变成模型可消费的 messages：
 1. system prompt
 2. 可选、会话稳定的 Skill Catalog
 3. 可选长期记忆 prompt block
-4. 当前 session 的历史消息
+4. 当前 epoch 内近期完整 turn（由 CrossTurnContextPhase 从 canonical
+   committed turn 重构，§3.1）
 5. 当前用户消息
 
-当前阶段还不调用真实 LLM，但先把结构稳定下来，后续 provider 可以直接复用。
+Session 不再维护消息历史副本；编译器只消费结构化的 ``recent_turns`` 来源，
+避免在编译前按消息条数提前裁剪压缩来源。
 """
 
 from __future__ import annotations
@@ -43,18 +45,8 @@ class ContextBuilder:
                 )
             )
 
-        if request.working_prompt_block:
-            messages.append(
-                ChatMessage(role="system", content=request.working_prompt_block)
-            )
-
-        for history_message in request.turn_state.session.get_history():
-            messages.append(
-                ChatMessage(
-                    role=history_message.role,
-                    content=history_message.content,
-                )
-            )
+        # 近期完整 turn：保持 tool correlation 与稳定顺序（§3.1）。
+        messages.extend(request.recent_turns)
 
         messages.append(
             ChatMessage(
@@ -67,3 +59,4 @@ class ContextBuilder:
             messages=messages,
             session_key=request.turn_state.session_key,
         )
+

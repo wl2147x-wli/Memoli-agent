@@ -107,3 +107,12 @@ Transformer 只能返回对应 Patch，不能任意修改共享上下文。工�
 Network、Memory、LLM、Secret 目前是默认拒绝的预留合同，不能被配置批准。
 
 详见 [插件安全边界](plugin-security.md)。
+
+## 内部 Profile 的 Hook 边界
+
+普通主 Agent 与可记录轨迹的 SubAgent 继续使用共享 HookBus。`memory-governor` 明确
+关闭轨迹，因此在构建 Reasoner 和 ToolRegistry 前选择 `NullTrajectoryStore` 与
+`hook_bus=None`。否则 `shell_safety` 的 `TOOL_BEFORE` 会先尝试把
+`plugin_hook_started` 写入主轨迹库中不存在的 governor trace，引发外键错误并被工具
+层表现为失败。`memory_default` 注册的是 `TURN_AFTER`，不是该故障来源。内部隔离不
+修改全局 Hook 注册表，也不影响主 Agent 的策略和观察事件。

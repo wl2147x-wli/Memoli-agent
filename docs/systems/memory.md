@@ -1,9 +1,10 @@
 # Memoli-agent 证据化记忆系统
 
-当前实现把五类状态明确分开：Session Context 保存短对话历史；Working State
-保存可恢复任务进度；SQLite trajectory 是完整运行证据；Personal Memory 保存经
-治理的用户事实与卡片；Procedural Skill 仍保持独立，本阶段只产生 skill candidate，
-不会自动发布 Skill 或训练数据。
+当前实现把六类状态明确分开：Session Context 保存近期完整对话与不可变任务内
+archive；Working State 保存可恢复任务进度；SQLite trajectory 与受管 payload 是
+完整运行证据；Personal Memory 保存经治理的用户事实与卡片；Procedural Skill 仍
+保持独立，本阶段只产生 skill candidate，不会自动发布 Skill 或训练数据。Context
+archive、冻结工具预览和压缩诊断都是派生模型视图，不会自动写入 Personal Memory。
 
 ## 在线与离线双循环
 
@@ -15,31 +16,70 @@ valid-time 硬过滤，再使用 RRF 融合、稳定并列规则和 Card/Claim/E
 Assistant 文本不能冒充系统指令。完整对话只写 `trajectory.db`，不再追加
 `HISTORY.md`。
 
-离线 consolidation 按 trace 范围或 `start_long_term_update` 请求读取已提交轨迹，
-逐段提取固定 schema 候选并校验证据。隐式推断默认只能进入 `candidate`；显式用户
+离线 consolidation 不再逐回合扫描。Trigger Coordinator 只在同一 `cli:` session
+累积到 20 条未消费普通回合，或单条已完成 trace 至少包含 10 次成功 business 工具
+调用且满足“至少两种业务工具或持续 60 秒”时创建请求。`start_long_term_update`
+只保存 `waiting-for-trigger` hint，不能绕过触发边界。提取只读取每条 trace 的当前
+用户 SourceSegment；Episode 仍读取完整 timeline。隐式推断默认只能进入 `candidate`；显式用户
 事实或人工批准才可发布为 `active`，frozen 冲突必须人工处理。Personal Memory、
 Skill、评测和后训练候选具有不同分类边界，本阶段只发布 Personal Memory。
+
+### 在线证据层与离线整理层的写入合同
+
+`remember`/`correct` 属于**在线证据层**：`content` 必须与当前用户消息中逐字
+`basis_quote` 一致（可去掉“请记住/记住/remember”指令包装），模型不得改写人称、
+加注或润色；无 `basis_quote` 或 `content` 与逐字依据不一致会被拒绝，错误码分别为
+`missing-explicit-basis` 与 `basis-content-mismatch`，拒绝信息会指明“逐字复制原话”
+的自纠正指引。单条显式用户陈述即可作为证据写入，但**是否沉淀为稳定语义记忆由离线
+整理层决定**——归纳、抽象、消歧与冲突合并不属本工具职责，离线 consolidation 才把
+隐式推断默认归入 `candidate`、把显式事实或人工批准发布为 `active`。
+
+这条合同防止“同一个模型既当裁判又直接改写正式记忆”：在线只锚定真实用户原话作
+证据，离线才在治理门槛下聚合/诊断/生成候选修改并经验证发布。其实现规则位于
+`memoli_agent/agent/tools/builtin.py`（`remember`/`correct` 校验与 `_same_fact`），
+触发边界与候选有效率由 `stabilize-triggered-memory-learning`、离线 Worker/
+Extractor/Governance SubAgent/consolidation 闭环由 `complete-offline-memory-learning`
+各自负责；本合同只澄清工具描述与拒绝信息如何传达这两层分工，不放松逐字合同、
+不改变 `correct` 的 versioned supersede，也不触碰触发阈值或离线整理层。
 
 ## 数据与索引
 
 - `working-state.db`：独立 schema-versioned 工作状态库，使用 expected revision
   原子 patch，支持 stale 标记与显式恢复；关闭个人记忆不会关闭它。
 - `trajectories.db`：唯一 append-only 原始运行证据，也是 Episode 原始细节来源。
+- `context-state.db`：独立 schema-versioned Session snapshot、不可变 archive、source
+  refs、冻结 preview 和压缩熔断状态；不迁移或改写 trajectory、memory 或 working state。
 - `memory.db`：append-only claims、多对多 evidence、版本化 cards、关系、修订、
   consolidation run、可重建 trajectory segments、semantic index 和派生任务状态。
-- 当前 SQLite schema 为 v3，启用外键和 `busy_timeout`。Claim 仅在同一 scope 内对
+- 当前 SQLite schema 为 v7，启用外键和 `busy_timeout`。Claim 仅在同一 scope 内对
   `candidate/active/approved/frozen` 做部分唯一约束；历史的 deleted、rejected 和
   superseded 不阻止用户重新记住相同内容。
-- 检索优先使用 FTS5，并为中文生成有界 1–3 gram 搜索字段；不可用时退化为有界
-  LIKE/关键词检索，并在结果中返回 `degraded=true`。
+
+Working State 的模型表示只有一条调用前装配路径：`PromptRenderPhase` 不生成遗留
+`<working_checkpoint>`，Reasoner 每次调用 Provider 前从当前 revision 重建唯一
+`<agent_status>`。其中 Runtime 状态和 `runtime_artifacts` 是硬状态；Agent 提交的
+objective、current step、next action、key info、constraints、decisions、related SOP
+与 `agent_artifacts` 是软 checkpoint，不能覆盖 Runtime 已验证事实。
+- 检索使用统一 `memory_search` 表（trigram tokenizer + `bm25()`）为 Claim、当前
+  Card statement 与 Episode 提供严格 FTS 召回；schema 7 迁移会从权威表回填该
+  派生 sparse 索引并在发布成功后才移除旧搜索表，失败回滚不改写权威记忆。FTS5/
+  trigram 不可用时探测为 unavailable，Pattern（有界 LIKE OR，≤16 term，转义
+  `%`/`_`）、semantic 与 metadata lane 继续独立工作，结果标记 `degraded=true`。
 - 语义向量以带 model/version/dimensions/content-hash 的 float32 BLOB 保存在 SQLite；
-  当前实现先做元数据预过滤，再进行精确余弦扫描。向量和索引 job 都是派生数据，
+  当前实现先做元数据预过滤，再进行精确余弦扫描。向量和 sparse 索引都是派生数据，
   可以删除重建，不能替代 Claim、CardVersion 或 trajectory。
 
-混合召回使用 `score = Σ lane_weight / (rrf_k + rank)`，不直接相加 BM25 和余弦
-原始分数。关键词 lane 保留 FTS5 BM25 主顺序，只在并列时使用治理等级、时间和稳定
-ID；所有 lane 都必须提供非空稳定 ID。Embedding 未配置、超时、
-维度错误或索引过期时，当前 turn 不等待补建，继续使用关键词与元数据通道。
+MemOS 风格混合召回把 FTS、Pattern、semantic、metadata 视作四条独立 lane：各 lane
+先在 SQL 内下推 scope/状态/敏感度/有效时间 hard filter 再取 lane 内 top-K，按 stable
+identity 去重聚合后融合 `fused = max(norm) + rrf_bonus_weight × Σ(weight/(rrf_k+rank))`
+（默认 `rrf_k=60`、`bonus=0.4`）。各 lane 用自己的规范化：FTS/Pattern 为 `1/rank`、
+semantic 为裁剪到 `[0,1]` 的余弦、metadata 为固定低相关分；raw BM25 标量仅用于安全
+诊断，不进入跨 lane 加法。随后依次施加相对阈值（默认 0.2）、多 lane 保护、按类型
+smart seed、确定性 MMR（优先复用同版本缓存向量，否则 token/CJK bigram Jaccard，绝不
+在线请求 embedding）与类型/数量/字符预算。`keyword_weight` 已移除：严格全文召回改用
+`fts_weight`，宽松 Pattern 召回改用 `pattern_weight`。所有 lane 都必须提供非空稳定 ID；
+Embedding 未配置、超时、维度错误或索引过期时，当前 turn 不等待补建，继续使用其他 lane
+并在 `degraded_lanes` 中记录降级原因。
 
 claim/card 状态包括 `candidate`、`active`、`approved`、`frozen`、`superseded`、`rejected`
 和 `deleted`；关系包括 `supports`、`corrects`、`contradicts`、`supersedes` 和
@@ -80,17 +120,36 @@ timeout_seconds = 30.0
 batch_size = 8
 candidate_limit = 200
 
+# MemOS 风格混合检索：FTS/Pattern/semantic/metadata 四 lane 独立召回后融合。
+# 旧键 `keyword_weight` 已移除（严格全文用 fts_weight，宽松 Pattern 用 pattern_weight）。
 [memory.hybrid]
 enabled = true
 rrf_k = 60
+rrf_bonus_weight = 0.4
 candidate_limit = 50
-keyword_weight = 1.0
+fts_candidate_limit = 64
+pattern_candidate_limit = 32
+pattern_term_limit = 16
+fts_weight = 1.0
+pattern_weight = 0.4
 semantic_weight = 1.0
 metadata_weight = 0.5
+relative_threshold = 0.2
+multi_lane_protection = true
+smart_seed_ratio = 0.7
+mmr_lambda = 0.7
 card_limit = 2
 claim_limit = 5
 episode_limit = 2
 spillover_order = ["claim", "card", "episode"]
+
+[memory.offline]
+auto_scan_enabled = false
+chat_turn_threshold = 20
+long_task_min_business_tool_calls = 10
+long_task_min_distinct_business_tools = 2
+long_task_min_elapsed_seconds = 60
+dead_letter_stale_after_seconds = 86400
 
 [working_memory]
 enabled = true
@@ -117,8 +176,14 @@ provider 相互独立，索引 worker 在启动和已发布回复后的空闲点
 claim 或推进 manifest。
 
 迁移从一次文件字节快照完成解析、哈希和备份，目标 scope 必须显式传入。数据库
-v1→v2→v3 逐条执行迁移语句，只有事务完整提交后才更新 `user_version`；中断后可从
+v1→v2→v3→v4→v6 逐条执行迁移语句，只有事务完整提交后才更新 `user_version`；中断后可从
 原版本幂等重试。
+
+v6 新增逐 trace consumption ledger 与 session update intent。旧
+`trajectory-auto-scan` checkpoint 会迁移成 `trace-consumption-baseline`，升级后不会
+因新 ledger 为空而回放旧轨迹。状态为 `observed / reserved / consumed /
+quarantined / suppressed / released`；request 创建和 reservation 同事务，Candidate、
+Evidence、关系、Governance Job、run/request 完成与 consumed 提交也在同一短事务。
 
 删除记忆后会立即停止召回并留下最小 revision/tombstone；原始 trajectory 按自身
 保留策略独立存在。工作状态通过 session/task key 显式恢复，系统不会把其他任务的
@@ -135,7 +200,8 @@ Card Builder 仅消费有效、同 scope、带 evidence 的 active/approved Clai
 时原子生成 CardVersion，相同内容不写新版本，frozen Card 不自动覆盖，candidate、
 rejected 和过期 Claim 不会进入卡片。
 Consolidator 会先在内存完成全部提取与证据校验，再在一个事务中提交 run、Claim、
-Card 和关系；失败只保留失败 run，不留下部分记忆。默认 Card 只能引用完整 Claim
+Evidence、关系、治理任务、派生任务入队及 consumption；失败不留下部分权威记忆。
+默认 Card 只能引用完整 Claim
 文本或其确定性组合，短子串不能证明整张 Card。
 
 ## 工具与诊断
@@ -146,6 +212,10 @@ Card 和关系；失败只保留失败 run，不留下部分记忆。默认 Card
   GenericAgent 九工具默认合同，它由 `tools.memory_manage_enabled=true` 显式启用。
 - remember/correct 必须携带当前用户消息中的逐字依据；无依据模型推断会被拒绝，
   离线流程则只能创建 candidate。
+- remember/correct 的 Claim 正文由 `basis_quote` 去掉允许的记忆指令包装后确定；模型
+  `content` 不一致会拒绝。Evidence 保存 message ID、原始 quote、trace locator、hash
+  和 verified 状态；健康与凭据事实不能把敏感度降到 public/private。correct 使用
+  expected revision 原子保存新 Claim、旧 Claim superseded 及关系。
 - export 默认只包含当前 Card 与 Claim，并保留 scope、状态、敏感级别、证据和时间；
   Episode 是轨迹派生数据，默认不纳入个人记忆导出。
 
@@ -158,3 +228,70 @@ schema、FTS、索引积压和向量数量；`MemoryIndexWorker.rebuild()` 与
 
 本阶段的固定回归集和延迟基准只验证确定性、预算与工程性能，不采集用户反馈、不训练
 排序器，也不构成反馈评测闭环。
+## Offline memory learning pipeline
+
+Offline learning is disabled by default. When `memory.consolidation_enabled=true`,
+the runtime validates a separately configured extractor and starts an
+`OfflineMemoryWorker`. Online turns only persist a long-term-update request or an
+Episode projection job and wake the worker; they never wait for extraction,
+governance, Card rebuilding, or embeddings.
+
+The authoritative flow is:
+
+1. A request references completed SQLite Trajectory IDs through a persistent
+   consumption ledger; it never stores caller
+   supplied transcript text.
+2. `TrajectorySourceReader` creates one immutable, scope-authorized current-user
+   Source Segment per trace. Missing legacy envelope metadata falls back to the last
+   user message and is marked `legacy-last-user`; Episode projection uses the full
+   timeline API instead.
+3. A versioned `CandidateExtractor` emits structured drafts. `EvidenceVerifier`
+   re-reads quote/offset/hash/role/scope data before an atomic Candidate batch is
+   committed.
+4. Explicit Claim dedup first matches message ID + quote, then structured fact slots
+   and value, then exact normalized hash. A match reuses the formal Claim and only
+   fills missing Evidence. Other semantic similarity remains a governed relation.
+   Same-slot facts record `supports`,
+   `contradicts`, `corrects`, or `supersedes` proposals. Candidate, governance job,
+   request completion, consolidation run, and auto-scan checkpoint share one
+   transaction.
+5. A leased governance job invokes the `memory-governor` SubAgent profile. Its only
+   tools read the bound Candidate, verified Evidence, same-scope Claims, and submit
+   a fixed decision. A deterministic Policy Gate rechecks risk, independent
+   evidence, conflicts, time, frozen targets, policy version, and expected revision.
+6. Approved facts enqueue recoverable Card and semantic-index jobs. Candidate,
+   rejected, superseded, expired, unsupported, and unresolved-conflict Claims do
+   not enter a current Card.
+
+`memory-governor` cannot read or write files, access the network, execute code, or
+delegate. Sensitive, conflicting, frozen-target, or otherwise uncertain Candidates
+remain `needs-user-review`. Users inspect them with `/memory candidates` and
+`/memory show <id>`, then use the confirmation form
+`/memory approve|reject <id> <revision> confirm`.
+
+The governor uses exactly four bound tools and a `NullTrajectoryStore`. Its Reasoner
+and ToolRegistry have no shared plugin HookBus, so `shell_safety` `TOOL_BEFORE` cannot
+write an unknown governor trace into `trajectories.db`. Governance decisions, task
+IDs, Policy Gate outcomes, and retry audit remain authoritative in `memory.db` and
+the SubAgent task graph.
+
+Deterministic Extractor v2 only splits explicit `请记住/记住/remember` lines and
+returns zero candidates for ordinary chat or questions. Zero candidates is a normal
+completed batch. Deployments that need implicit learning must configure and validate
+the structured OpenAI-compatible Extractor; existing noisy Candidates are reviewed
+or governed, never auto-deleted or auto-approved.
+
+### Card-first retrieval
+
+Cards are versioned materialized views. Each current `card_statement` stores its
+ordered Claim references; retrieval never parses display Markdown to discover
+provenance. `auto` routes profile/preference/overview questions to Card-first,
+exact/current/source/high-risk questions to Claim-first, event/process questions to
+Episode-first, and uncertain questions to bounded hybrid retrieval. `summary` stops
+at statements, `fact` expands to governed Claims, and `evidence` retains their
+authorized Evidence references. Missing or stale Card projections safely fall back
+to Claims and report the actual route and degradation reason.
+
+Prompt use and embedding use are independent policy decisions at Source Segment,
+Claim, Card, statement, and Episode boundaries. Remote extractor and embedding
+calls recheck those flags before sending content.

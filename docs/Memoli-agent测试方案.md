@@ -54,7 +54,7 @@ pyright
 | 2.1.5 | 非法枚举值 | `provider = "unknown"` | 抛出验证错误 | P0 |
 | 2.1.6 | 数值边界 | `max_iterations = 0` | 验证失败或默认值 | P1 |
 | 2.1.7 | 嵌入配置验证 | `embedding.enabled=true` 但无 API key | 验证失败或降级 | P1 |
-| 2.1.8 | 混合检索权重 | `keyword_weight=0, semantic_weight=0, metadata_weight=0` | 验证失败或降级 | P2 |
+| 2.1.8 | 混合检索权重 | `fts_weight=0, pattern_weight=0, semantic_weight=0, metadata_weight=0` | 验证失败或降级 | P2 |
 
 ### 2.2 应用运行时装配（`bootstrap/app.py`）
 
@@ -115,7 +115,7 @@ pyright
 | 2.6.2 | Hook 集成 | 每个阶段 | HookBus 对应事件被触发 | P0 |
 | 2.6.3 | 记忆预召回 | auto_recall=true | 在 BeforeReasoning 阶段调用 pre_recall | P1 |
 | 2.6.4 | 记忆禁用 | auto_recall=false | 跳过 pre_recall | P1 |
-| 2.6.5 | 工作状态注入 | working_memory.enabled=true | ContextBuilder 包含 working block | P1 |
+| 2.6.5 | 工作状态注入 | working_memory.enabled=true | PromptRender 不预置旧块；每次 Provider 调用前只有一个最新 `<agent_status>` | P1 |
 
 ### 2.7 LLM Provider（`agent/provider.py`）
 
@@ -141,9 +141,9 @@ pyright
 
 | # | 测试项 | 输入 | 预期结果 | 优先级 |
 |---|--------|------|----------|--------|
-| 2.9.1 | 完整 prompt 组装 | system + memory + working + history + user | 各部分正确拼接 | P0 |
+| 2.9.1 | 完整 prompt 组装 | system + memory + history + user | 初始内容正确拼接，Working State 留给调用前动态尾部 | P0 |
 | 2.9.2 | 无记忆块 | memory=None | 不包含 memory block | P1 |
-| 2.9.3 | 无工作状态 | working=None | 不包含 working block | P1 |
+| 2.9.3 | 无工作状态 | checkpoint 不存在 | 调用前状态明确显示 unavailable，不创建空 checkpoint | P1 |
 | 2.9.4 | 空历史 | [] | 不包含历史消息 | P1 |
 
 ### 2.10 证据化记忆系统（`agent/memory/`）

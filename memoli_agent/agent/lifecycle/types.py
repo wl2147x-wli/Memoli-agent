@@ -13,7 +13,7 @@ from memoli_agent.agent.core.results import TurnResult
 from memoli_agent.agent.memory.runtime import MemoryQueryResult
 from memoli_agent.agent.provider import LLMResponse
 from memoli_agent.agent.session import Session
-from memoli_agent.agent.types import ContextRenderResult, TurnState
+from memoli_agent.agent.types import ChatMessage, ContextRenderResult, TurnState
 from memoli_agent.bus.events import InboundMessage, OutboundMessage
 
 
@@ -28,7 +28,12 @@ class PassiveTurnContext:
     memory_query_result: MemoryQueryResult | None = None
     memory_prompt_block: str = ""
     skill_catalog_prompt_block: str = ""
-    working_prompt_block: str = ""
+    # 当前 conversation epoch：由 CrossTurnContextPhase 从 trajectory store 读取
+    # 权威值后写入（§3.1）；无 durable source 时保持镜像默认，供诊断使用。
+    conversation_epoch: int = 1
+    # 近期完整 turn 重构出的可见消息（§3.1）：由 CrossTurnContextPhase 写入，
+    # PromptRenderPhase 消费。无 durable source 时为空元组，不拼接旧 Session history。
+    recent_turns: tuple[ChatMessage, ...] = ()
     llm_response: LLMResponse | None = None
     turn_result: TurnResult | None = None
     outbound: OutboundMessage | None = None

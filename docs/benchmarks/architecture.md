@@ -46,6 +46,7 @@ benchmarks/
   metrics/
     common.py
     locomo.py
+    layered_memory.py
 
   reports/
     writer.py
@@ -714,6 +715,41 @@ benchmarks/metrics/common.py
 }
 ```
 
+### 15.1 记忆学习分层评估：metrics/layered_memory.py（可选，非干扰）
+
+文件：
+
+```text
+benchmarks/metrics/layered_memory.py
+```
+
+按《ai-agent-book》第 8 章表 8-3，把“记忆写入与离线整理闭环”的评估拆成四层，
+区分**更新器能力**（harness-updating：把记忆写对没有？）与**受益能力**
+（harness-benefit：写进来的记忆让回答变好了没有？），避免仅以端到端回答分数反推
+更新器好坏。模块只消费既有审计证据，不引入侵入式埋点；任一信号缺失时对应指标返回
+`null`，而非失败；未启用时（`[metrics].layered_memory = false`，默认）完全不参与
+LoCoMo/LongMemEval 官方评分。
+
+四项指标：
+
+| 指标 | 含义 | 证据来源 |
+|---|---|---|
+| `adherence_rate` | 遵循成功率：通过逐字证据合同的 `remember/correct` 调用比例 | 只读扫描 `trajectories.db` 中 `memory_manage` 工具结果 |
+| `candidate_validity_rate` | 候选修改有效率：经 Governance 批准并成功投影的 Candidate 比例 | 治理服务 `list_candidates` 的 `status` |
+| `activation_rate` | 产物激活率：被召回记忆在正确场景被命中的比例 | Memoli adapter 显式发起召回的命中追踪 |
+| `held_out_gain` | 留出任务增益：召回相关记忆后的回答质量相对基线的增益 | 预测记录 `metadata.baseline_score`/`treatment_score` |
+
+**遵循失败 ≠ 规则错误**：`missing-explicit-basis` 与 `basis-content-mismatch` 两种
+合同拒绝在 `adherence_rate` 中计为**遵循失败**而非规则错误——它们是逐字证据合同
+正确起作用的预期结果（模型试图改写/无依据时被拒绝），不是系统故障。这与官方 QA 分
+数完全分开：`report.md` 的“记忆学习分层评估”章节只在存在证据时出现，官方“总体指标”
+章节始终独立存在。
+
+适配器通过可选的 `memory_audit()` 钩子向 `collect_layered_memory()` 提供
+`LayeredMemoryAudit`；不提供该钩子的适配器（HTTP/CLI/Python）会让分层指标为 `null`，
+不影响其官方评分。Memoli adapter 的 `memory_audit()` 全部 best-effort 且守护：任一
+信号不可得时对应证据为空、指标为 `null`，绝不抛出。
+
 ## 16. 报告输出：reports/writer.py
 
 文件：
@@ -775,6 +811,7 @@ total_questions
 overall
 by_question_type
 config
+layered_memory (可选；未启用或无证据时为 null)
 ```
 
 ### 17.3 report.md

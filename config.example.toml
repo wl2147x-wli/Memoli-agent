@@ -5,7 +5,11 @@ workspace = "workspace"
 # 默认示例不联网；正式模型请从下方示例中任选一种替换本段。
 provider = "echo"
 model = "echo"
-stream = false
+stream = true
+context_window_tokens = 131072
+context_safety_margin_tokens = 4096
+token_estimator = "conservative"
+# 正式 Provider 默认流式；需要一次性最终输出时显式改为 false。
 
 # OpenAI：
 # provider = "openai"
@@ -45,6 +49,9 @@ stream = false
 # provider = "primary"
 # model = "<anthropic-model-id>"
 # capabilities = ["text", "tools", "reasoning", "streaming", "prompt-cache"]
+# context_window_tokens = 200000
+# context_safety_margin_tokens = 4096
+# token_estimator = "conservative"
 #
 # [llm.models.fallback]
 # provider = "backup"
@@ -60,7 +67,34 @@ name = "Memoli"
 max_iterations = 12
 max_elapsed_seconds = 300
 no_progress_limit = 3
-history_window = 20
+# history_window 已移除：跨轮上下文改由 [context] 的 token 预算治理（§3.5）。
+
+[context]
+enabled = true
+compaction_enabled = true
+persistence_enabled = true
+database = "workspace/context-state.db"
+soft_threshold_ratio = 0.75
+hard_threshold_ratio = 0.90
+recent_tail_tokens = 12000
+preview_tokens = 2000
+archive_tokens = 4000
+# §6.4 有界 archive frontier：聚合注入的活动 frontier token 预算与节点数上限
+# （§8.1 严格校验：必须 > 0）。长会话只注入有界 frontier，archive 不再无界累积。
+archive_frontier_tokens = 16000
+archive_frontier_max_items = 8
+# §8.1 跨轮来源单次读取上限（I/O 防护，非语义历史窗口）。省略/留空 = 不限
+# （保守默认）。到达上限时 reader 返回 source-truncated 诊断，协调器分批推进，
+# 不谎称更老内容不存在（design line 77/156）。
+# source_read_max_turns = 50
+# source_read_max_bytes = 524288
+# §8.1 单次压缩批次 token 上限：§5.2 批次选择时最旧完整 turn 累计 token 达此
+# 上限即停止扩充，剩余未覆盖 turn 留待下一轮分批推进（必须 > 0）。
+compaction_batch_tokens = 32000
+plugin_max_tokens = 2000
+emergency_retry_limit = 1
+compaction_failure_limit = 2
+compaction_profile = ""
 
 [trajectory]
 enabled = true
@@ -101,17 +135,91 @@ timeout_seconds = 30.0
 batch_size = 8
 candidate_limit = 200
 
+# MemOS 风格混合检索：FTS（严格全文）/Pattern（宽松 LIKE）/semantic/
+# metadata 四条独立 lane 各自召回，再经 base + 加权 RRF 融合。
+# 注意：旧键 `keyword_weight` 已移除；严格全文召回用 `fts_weight`，
+# 宽松 Pattern 召回用 `pattern_weight`。沿用旧键会以配置错误拒绝启动并
+# 打印迁移提示。
 [memory.hybrid]
 enabled = true
+# 融合：fused = max(norm) + rrf_bonus_weight × Σ(weight/(rrf_k+rank))。
 rrf_k = 60
+rrf_bonus_weight = 0.4
+# 各 lane 召回后先经 hard filter 再取 lane 内 top-K。
 candidate_limit = 50
-keyword_weight = 1.0
+fts_candidate_limit = 64
+pattern_candidate_limit = 32
+pattern_term_limit = 16
+# lane 权重：至少一个大于 0。
+fts_weight = 1.0
+pattern_weight = 0.4
 semantic_weight = 1.0
 metadata_weight = 0.5
+# 选择：相对相关性阈值 + 多 lane 保护（均不能绕过 hard filter）。
+relative_threshold = 0.2
+multi_lane_protection = true
+smart_seed_ratio = 0.7
+# 确定性 MMR：优先复用同版本缓存向量，否则 token/CJK bigram Jaccard，
+# 绝不在线请求 embedding。
+mmr_lambda = 0.7
+# 类型配额与 spillover 作为最终硬边界。
 card_limit = 2
 claim_limit = 5
 episode_limit = 2
 spillover_order = ["claim", "card", "episode"]
+
+# 离线学习默认不运行；只有 memory.consolidation_enabled=true 且 extractor
+# 配置有效时才启动独立 Worker。
+[memory.offline]
+# Keep consolidation_enabled=false and this false until SQLite Trajectory scope,
+# redaction, extractor privacy policy, and governance review have been verified.
+poll_seconds = 2.0
+batch_size = 4
+lease_seconds = 120
+max_attempts = 5
+retry_max_seconds = 300
+auto_scan_enabled = false
+chat_turn_threshold = 20
+long_task_min_business_tool_calls = 10
+long_task_min_distinct_business_tools = 2
+long_task_min_elapsed_seconds = 60
+dead_letter_stale_after_seconds = 86400
+
+[memory.offline.extractor]
+provider = "disabled" # disabled / deterministic / openai-compatible
+model = ""
+version = "1"
+schema_version = "1"
+prompt_version = "1"
+policy_version = "1"
+segmenter_version = "1"
+base_url = "https://api.openai.com/v1"
+api_key_env = "MEMOLI_MEMORY_EXTRACTOR_API_KEY"
+# The credential is read only from this environment variable, never this TOML file.
+timeout_seconds = 60.0
+prompt_max_sensitivity = "private"
+
+[memory.offline.governance]
+# This least-privilege profile has no file, network, code, or delegation tools.
+enabled = true
+profile = "memory-governor"
+policy_version = "1"
+prompt_version = "1"
+batch_size = 8
+lease_seconds = 120
+max_attempts = 5
+min_independent_evidence = 2
+auto_approve_explicit_low_risk = true
+auto_approve_implicit_low_risk = true
+low_risk_fact_types = ["preference", "profile", "project", "goal"]
+
+[memory.retrieval]
+mode = "auto"
+detail_level = "summary"
+card_statement_limit = 6
+claim_expansion_limit = 6
+evidence_expansion_limit = 3
+direct_claim_fallback = true
 
 [working_memory]
 enabled = true
@@ -154,6 +262,13 @@ allow_runtime_management = false
 
 [channels.cli]
 enabled = true
+# 非 TTY 自动降级；也可设为 false 强制使用 plain CLI。
+interactive = true
+# auto 尊重 NO_COLOR；never 永久关闭颜色。
+color = "auto"
+refresh_hz = 12
+queue_limit = 8
+max_tool_rows = 6
 
 [plugins]
 enabled = ["memory_default", "shell_safety"]

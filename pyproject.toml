@@ -4,18 +4,21 @@ version = "0.1.0"
 description = "A memory-focused extensible agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [
+  { name = "Memoli-agent contributors" }
+]
 dependencies = [
   "anthropic>=0.121,<1",
   "mcp>=1.27,<2",
   "openai>=2.44,<3",
+  "prompt_toolkit>=3.0.51,<4",
   "PyYAML>=6.0,<7",
+  "rich>=14.0,<15",
 ]
 
 [project.scripts]
+memoli = "memoli_agent.cli:main"
 memoli-skills = "memoli_agent.skills_cli:main"
-authors = [
-  { name = "Memoli-agent contributors" }
-]
 
 [project.optional-dependencies]
 dev = [
@@ -24,6 +27,12 @@ dev = [
   "pyright>=1.1.0"
 ]
 
+[tool.setuptools.packages.find]
+include = ["memoli_agent*"]
+
+[tool.setuptools.package-data]
+memoli_agent = ["skills/**/*.md", "plugins/**/*.toml"]
+
 [tool.pyright]
 include = ["memoli_agent", "benchmarks", "tests"]
 pythonVersion = "3.11"
@@ -31,6 +40,7 @@ pythonVersion = "3.11"
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+extend-exclude = ["tests/.pytest_basetemp"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

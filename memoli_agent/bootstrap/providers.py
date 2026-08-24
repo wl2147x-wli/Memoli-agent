@@ -19,6 +19,7 @@ class ProviderBundle:
 
     provider: LLMProvider
     model_name: str
+    targets: dict[str, ProviderTarget]
 
 
 def build_model_provider(config: LLMConfig) -> ProviderBundle:
@@ -34,10 +35,13 @@ def build_model_provider(config: LLMConfig) -> ProviderBundle:
                 provider=provider,
                 capabilities=capabilities,
                 max_output_tokens=config.max_output_tokens,
+                context_window_tokens=config.context_window_tokens,
+                context_safety_margin_tokens=config.context_safety_margin_tokens,
+                token_estimator=config.token_estimator,
             ),
             (),
         )
-        return ProviderBundle(router, config.model)
+        return ProviderBundle(router, config.model, {"default": router.primary})
 
     endpoint_clients: dict[str, LLMProvider] = {}
     for endpoint_name, endpoint in config.providers.items():
@@ -60,12 +64,16 @@ def build_model_provider(config: LLMConfig) -> ProviderBundle:
             provider=provider,
             capabilities=effective,
             max_output_tokens=profile.max_output_tokens,
+            context_window_tokens=profile.context_window_tokens,
+            context_safety_margin_tokens=profile.context_safety_margin_tokens,
+            token_estimator=profile.token_estimator,
             temperature=profile.temperature,
         )
 
-    primary = target(config.routes.agent)
-    fallbacks = tuple(target(name) for name in config.routes.fallback)
-    return ProviderBundle(ModelRouter(primary, fallbacks), primary.model)
+    targets = {name: target(name) for name in config.models}
+    primary = targets[config.routes.agent]
+    fallbacks = tuple(targets[name] for name in config.routes.fallback)
+    return ProviderBundle(ModelRouter(primary, fallbacks), primary.model, targets)
 
 
 def _legacy_provider(config: LLMConfig) -> LLMProvider:

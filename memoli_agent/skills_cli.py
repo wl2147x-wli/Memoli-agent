@@ -56,9 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if item is None:
                     raise ValueError("Skill 版本不存在。")
                 _print(
-                    components.admin.inspect(
-                        item, tools=_configured_tool_names(config)
-                    )
+                    components.admin.inspect(item, tools=_configured_tool_names(config))
                 )
             elif command in {"activate", "deprecate", "revoke", "rollback"}:
                 operation = getattr(components.admin, command)

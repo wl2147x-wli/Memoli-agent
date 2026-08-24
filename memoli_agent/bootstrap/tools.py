@@ -39,6 +39,7 @@ from memoli_agent.agent.tools.generic import (
     FileWriteTool,
 )
 from memoli_agent.agent.tools.registry import ToolRegistry
+from memoli_agent.agent.tools.tool_search import ToolSearchTool
 from memoli_agent.agent.trajectory import TrajectoryStore
 from memoli_agent.bootstrap.config import AppConfig
 
@@ -86,7 +87,7 @@ def build_tool_registry(
     registry.register(FileWriteTool(workspace))
     registry.register(UpdateWorkingCheckpointTool(state))
     registry.register(AskUserTool())
-    registry.register(StartLongTermUpdateTool(state))
+    registry.register(StartLongTermUpdateTool(state, memory_runtime))
     registry.register(TimeTool())
     registry.register(MemoryRecallTool(memory_runtime))
     if config.tools.memory_manage_enabled:
@@ -107,6 +108,9 @@ def build_tool_registry(
                 trajectory_store=trajectory_store,
             )
         )
+    if config.tools.tool_search_enabled:
+        registry.register(ToolSearchTool(registry))
+        registry.enable_progressive_disclosure()
 
     return registry
 

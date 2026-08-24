@@ -46,6 +46,4 @@ class RequirementEvaluator:
 
 def _platform_name() -> str:
     name = platform.system().lower()
-    return {"darwin": "macos", "windows": "windows", "linux": "linux"}.get(
-        name, name
-    )
+    return {"darwin": "macos", "windows": "windows", "linux": "linux"}.get(name, name)

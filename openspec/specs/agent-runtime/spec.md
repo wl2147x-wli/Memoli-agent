@@ -64,18 +64,25 @@
 
 ### Requirement: Session-aware passive turns
 
-系统 SHALL 按消息的 session key 维护有限窗口的对话历史，并通过统一生命周期生成出站消息。
+系统 SHALL 按消息的 session key 维护近期完整 turn、不可变上下文归档和有限兼容窗口，并通过统一生命周期生成出站消息；进程或显式 Session 恢复能力仅在相应持久上下文状态可靠可用时成立。
 
 #### Scenario: User sends a CLI message
 
 - **WHEN** 通道发布一条普通入站消息
-- **THEN** 系统 SHALL 依次准备会话、查询上下文、渲染 prompt、执行推理、保存历史并构造出站消息
+- **THEN** 系统 SHALL 依次准备会话、查询动态上下文、编译有预算的 prompt、执行推理、保存历史并构造出站消息
 
 #### Scenario: Conversation continues
 
-- **GIVEN** 同一 session key 已有历史消息
+- **GIVEN** 同一 session key 已有近期历史或不可变 archive
 - **WHEN** 新消息到达
-- **THEN** prompt SHALL 包含受 `history_window` 限制的相关会话历史
+- **THEN** prompt SHALL 包含受 token 预算约束的相关归档和近期完整 turn
+- **AND** `history_window` SHALL 仅作为兼容或安全上限而不得拆散工具关联或任意半轮消息
+
+#### Scenario: Runtime restarts without context persistence
+
+- **WHEN** Runtime 未启用或无法可靠读取 Session context persistence
+- **THEN** 系统 SHALL 创建新的进程内 Session 上下文
+- **AND** SHALL NOT 声称已恢复仅存在于旧进程内存的对话历史
 
 ### Requirement: Runtime lifecycle
 
@@ -113,7 +120,7 @@
 
 ### Requirement: Explicit serial loop outcomes
 
-每个 turn SHALL 产生 `completed`、`needs-user`、`failed` 或 `budget-exhausted` 之一的结构化终止原因，并关联稳定的 trace 标识。
+每个 turn SHALL 产生 `completed`、`needs-user`、`failed`、`budget-exhausted` 或 `cancelled` 之一的结构化终止原因，并关联稳定的 trace 标识；取消当前 turn SHALL NOT 隐式取消整个消息泵。
 
 #### Scenario: Required user input is unavailable
 
@@ -132,6 +139,18 @@
 - **GIVEN** 主 Provider 调用失败且现有 fallback 成功
 - **WHEN** 串行循环继续或完成
 - **THEN** 终止结果和运行轨迹 SHALL 标识 fallback 已被使用
+
+#### Scenario: User cancels current turn
+
+- **WHEN** 前台通道对活动 turn 发出用户取消请求
+- **THEN** 系统 SHALL 取消该 turn 的 Provider、工具等待和后续操作并以 `cancelled` 结束
+- **AND** AgentLoop SHALL 保持运行并继续消费后续排队消息
+
+#### Scenario: Runtime cancels the message pump
+
+- **WHEN** Runtime 关闭并取消 AgentLoop 消息泵
+- **THEN** 系统 SHALL 传播控制流取消并有序停止
+- **AND** SHALL NOT 将其转换为某个用户 turn 的 `cancelled` 回复
 
 ### Requirement: Bounded loop execution
 
@@ -301,25 +320,31 @@
 
 ### Requirement: Unified dynamic context assembly
 
-Runtime SHALL 在每次 Provider 调用前通过统一装配边界生成模型可见上下文：静态基础规则之后纳入当前 Session 稳定且有界的 Skill catalog，再依次纳入当前交互、受限会话历史、个人记忆上下文和最新工作状态；同一 Session 的静态 system 前缀和 Skill catalog SHALL 不因每轮动态状态或 active 指针变化而重写。
+Runtime SHALL 在每次 Provider 调用前通过统一、缓存感知且有全局预算的编译边界生成模型可见上下文：稳定基础规则和当前 Session 冻结的 Skill/tool 前缀之后依次纳入不可变任务归档、近期完整交互，再在动态尾部纳入个人记忆、插件扩展和唯一最新工作状态；动态内容或 active 指针 SHALL NOT 重写稳定前缀。
 
 #### Scenario: Initial model decision is prepared
 
 - **WHEN** Runtime 为新的用户 turn 准备首次模型调用
-- **THEN** 模型可见上下文 SHALL 包含当前用户输入、可用 Skill catalog、核心记忆、自动召回结果和当前工作状态
-- **AND** Skill catalog、动态数据 SHALL 使用可区分于终端用户指令和静态安全规则的边界
+- **THEN** 模型可见上下文 SHALL 包含当前用户输入、可用的冻结 Skill catalog、核心/自动召回记忆和当前工作状态
+- **AND** Skill catalog、插件段、记忆、archive 和工作状态 SHALL 使用可区分于终端用户指令和静态安全规则的边界
 
 #### Scenario: A later tool-loop decision is prepared
 
 - **WHEN** Skill 或通用工具结果已经提交且 Runtime 准备同一 turn 的后续模型调用
-- **THEN** 模型可见上下文 SHALL 包含该工具结果和其后生成的最新工作状态
-- **AND** SHALL NOT 继续注入已过期的工作状态版本或运行中重写 Session Skill catalog
+- **THEN** 模型可见上下文 SHALL 包含完整关联的工具调用/结果和其后的唯一最新工作状态
+- **AND** SHALL NOT 注入过期状态、重新渲染已冻结前缀或拆散工具协议消息
 
 #### Scenario: No Skill is available
 
 - **WHEN** Skill Runtime 关闭、降级或当前 Session 没有可见 Skill
-- **THEN** Runtime SHALL 在不伪造空 Skill 指令的情况下装配现有交互、历史、记忆和工作状态
+- **THEN** Runtime SHALL 在不伪造空 Skill 指令的情况下编译现有交互、历史归档、记忆和工作状态
 - **AND** 普通 Agent Loop SHALL 保持可用
+
+#### Scenario: Context compiler is disabled for compatibility
+
+- **WHEN** 配置显式关闭压缩但仍启用统一编译诊断
+- **THEN** Runtime SHALL 保持标准消息角色和现有 Agent Loop 行为
+- **AND** 仍 SHALL 在超出模型硬输入预算前返回明确错误而不是发送已知无效请求
 
 ### Requirement: Dynamic context trust separation
 
@@ -333,13 +358,35 @@ Runtime SHALL 将召回记忆和工作状态分别标识为事实参考与 Harne
 
 ### Requirement: Deterministic dynamic-context budget
 
-Runtime SHALL 对核心卡片、自动召回记忆和工作状态分别应用可配置预算，并按明确优先级裁剪动态内容。
+Runtime SHALL 在模型全局输入预算内对核心卡片、自动召回记忆、插件段、历史归档、近期轨迹和工作状态应用独立上限与确定性优先级，并记录实际注入、裁剪和压缩量。
 
 #### Scenario: Dynamic context exceeds its budget
 
-- **WHEN** 所有候选动态块总量超过配置预算
-- **THEN** Runtime SHALL 保留当前真实交互、安全边界、确定性工作状态、用户约束和显式冻结核心记忆
-- **AND** SHALL 先裁剪低优先级情景细节并记录实际注入量
+- **WHEN** 所有候选动态块总量超过可用模型输入预算
+- **THEN** Runtime SHALL 保留当前真实交互、安全边界、确定性工作状态、用户约束、工具协议完整性和显式冻结核心记忆
+- **AND** SHALL 先裁剪低优先级情景细节、插件扩展和重复工具噪声并记录原因
+
+#### Scenario: Legacy per-component budgets are configured
+
+- **WHEN** Memory、Working State、Skill 或工具仍配置已有字符上限
+- **THEN** 这些上限 SHALL 作为对应组件候选生成的局部硬上限继续生效
+- **AND** SHALL NOT 替代 Provider 前的全局 token 预算检查
+
+### Requirement: Context configuration compatibility
+
+系统 SHALL 为模型窗口、输出预留、安全余量、压缩阈值、近期 tail、archive/preview 预算和压缩失败上限提供可校验配置，并在旧配置缺少新字段时使用保守默认值。
+
+#### Scenario: Legacy configuration is loaded
+
+- **WHEN** 配置包含现有 Agent/Memory/Working State/Skill 字段但没有 context management 字段
+- **THEN** Runtime SHALL 使用保守内置 context window 和默认压缩参数启动
+- **AND** SHALL 保留现有 `history_window` 和组件字符上限的兼容语义
+
+#### Scenario: Context thresholds are invalid
+
+- **WHEN** 输出预留、安全余量或阈值导致可用输入预算非正，或 soft threshold 不低于 hard threshold
+- **THEN** 系统 SHALL 在发出模型请求前报告配置错误
+- **AND** SHALL NOT 静默禁用预算保护
 
 ### Requirement: Memory-context failure isolation
 
@@ -415,3 +462,68 @@ Runtime SHALL 将 catalog 视为 Harness 提供的路由元数据，将成功加
 - **THEN** Runtime SHALL 拒绝加载或返回明确的有界失败结果
 - **AND** SHALL NOT 静默截断关键程序性说明后将其标记为成功加载
 
+### Requirement: Structured safe presentation events
+
+Runtime SHALL 为前台表现层投影结构化、有界、非权威事件，并 SHALL 将事件与 session、trace、turn 和 step 关联，而不暴露 Provider SDK 对象或隐藏内容。
+
+#### Scenario: Turn progresses through model and tool steps
+
+- **WHEN** turn 开始、模型产生文本、工具开始或结束、usage 更新且 turn 最终结束
+- **THEN** Runtime SHALL 按发生顺序发出对应的安全事件类型与稳定关联标识
+- **AND** 最终 Outbound/终止结果 SHALL 继续作为用户可见完成状态的权威来源
+
+#### Scenario: Provider emits hidden content
+
+- **WHEN** 原始 Provider 事件包含 reasoning、thinking 或工具参数增量
+- **THEN** Runtime SHALL 在进入 presentation channel 前过滤或转换为无内容的安全阶段事件
+- **AND** SHALL NOT 依赖终端 renderer 再清除秘密
+
+#### Scenario: Presentation observer fails or lags
+
+- **WHEN** 表现事件队列已满、观察者抛错或 renderer 消费缓慢
+- **THEN** Runtime SHALL 丢弃或合并可降级表现事件并继续 Agent 行为
+- **AND** 最终 Outbound、轨迹证据和工具副作用 SHALL 不受影响
+
+### Requirement: Interactive chat streams by default
+
+正式 Provider 支持 streaming 且用户未显式关闭时，交互式 chat SHALL 请求流式模型响应；非交互调用和显式关闭 SHALL 保持确定性一次性响应能力。
+
+#### Scenario: Streaming-capable provider starts interactive turn
+
+- **WHEN** TTY chat 使用声明 streaming 能力的正式 Provider 且配置未关闭 streaming
+- **THEN** 每次模型请求 SHALL 启用 Provider 的流式协议并产生规范化文本/usage/工具事件
+- **AND** 最终统一模型响应 SHALL 与已接收增量语义一致
+
+#### Scenario: User explicitly disables streaming
+
+- **WHEN** 配置设置 `llm.stream = false`
+- **THEN** Runtime SHALL 使用非流式 Provider 调用并只在完成后返回统一响应
+- **AND** Agent Loop、轨迹和终止判定 SHALL 保持等价
+
+#### Scenario: Stream fails after partial output
+
+- **WHEN** Provider 在已经产生用户可见文本或工具增量后中断
+- **THEN** Runtime SHALL 将错误标识为 partial-stream 并停止透明 fallback 拼接
+- **AND** SHALL 向表现层发出安全失败状态且不把部分文本宣称为完成答案
+
+### Requirement: Isolated active-turn cancellation
+
+AgentLoop SHALL 维护可寻址的当前 turn 取消边界，使通道可以取消活动处理而不并发执行消息、不丢失整个消息泵或错误关联后续回复。
+
+#### Scenario: Cancellation arrives during provider request
+
+- **WHEN** 用户停止请求发生在活动 Provider stream 中
+- **THEN** Runtime SHALL 关闭 Provider stream、完成必要轨迹终止记录并释放 turn 资源
+- **AND** SHALL NOT 启动 fallback 或继续工具调用
+
+#### Scenario: Cancellation arrives during tool execution
+
+- **WHEN** 用户停止请求发生在可取消的活动工具等待中
+- **THEN** Runtime SHALL 请求取消并阻止后续模型步骤
+- **AND** 对无法安全撤销的已发生副作用 SHALL 只报告真实状态而不声称回滚
+
+#### Scenario: Queued message follows cancelled turn
+
+- **WHEN** 当前 turn 被取消且队列中已有下一条消息
+- **THEN** AgentLoop SHALL 在取消清理完成后处理下一条消息
+- **AND** 下一条 Outbound SHALL 使用自己的 trace 和输入关联

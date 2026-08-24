@@ -349,7 +349,9 @@ def test_checkpoint_ask_user_and_long_term_request_use_runtime_context(
     repeated = run(registry.execute("start_long_term_update", {}, context=context))
 
     assert checkpoint.success
-    assert "先读文件" in state.render_checkpoint("session-1")
+    persisted = state.get_checkpoint("session-1")
+    assert persisted is not None
+    assert persisted.key_info == "先读文件"
     assert question.metadata["needs_user"] is True
     assert question.status == "needs-user"
     assert request.content == repeated.content

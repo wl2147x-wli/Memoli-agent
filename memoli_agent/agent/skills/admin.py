@@ -132,9 +132,7 @@ class SkillAdminService:
             "missing_requirements": list(availability.missing),
             "requested_permissions": manifest.get("requested_permissions", {}),
             "risk": manifest.get("risk", "low"),
-            "governance": self.repository.governance(
-                version.name, version.version
-            ),
+            "governance": self.repository.governance(version.name, version.version),
         }
 
     def activate(

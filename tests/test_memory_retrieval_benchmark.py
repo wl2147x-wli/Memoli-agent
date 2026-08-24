@@ -9,9 +9,10 @@ from benchmarks.memory_retrieval import (
     run_semantic_scale_benchmark,
 )
 from memoli_agent.agent.memory.hybrid import (
+    FtsSearchLane,
     HybridMemoryRetriever,
-    KeywordSearchLane,
     MetadataSearchLane,
+    PatternSearchLane,
     SemanticSearchLane,
 )
 from memoli_agent.agent.memory.models import EvidenceRef, MemoryMutation
@@ -39,9 +40,10 @@ def test_fixed_memory_regression_is_stable_and_bounded(tmp_path: Path) -> None:
     worker = MemoryIndexWorker(store, embedder, batch_size=10)
     retriever = HybridMemoryRetriever(
         store,
-        KeywordSearchLane(store),
-        MetadataSearchLane(store),
-        SemanticSearchLane(store, embedder),
+        fts_lane=FtsSearchLane(store),
+        pattern_lane=PatternSearchLane(store),
+        metadata_lane=MetadataSearchLane(store),
+        semantic_lane=SemanticSearchLane(store, embedder),
     )
 
     async def scenario() -> None:

@@ -54,9 +54,13 @@ def test_checkpoint_is_injected_into_next_user_turn(tmp_path: Path) -> None:
         ]
     )
     pipeline = PassiveTurnPipeline(
-        session_manager=SessionManager(history_window=20),
+        session_manager=SessionManager(),
         context_builder=ContextBuilder("Memoli", "system"),
-        reasoner=Reasoner(provider, tool_registry=registry),
+        reasoner=Reasoner(
+            provider,
+            tool_registry=registry,
+            working_state=state,
+        ),
         working_state=state,
     )
 
@@ -70,8 +74,13 @@ def test_checkpoint_is_injected_into_next_user_turn(tmp_path: Path) -> None:
     checkpoint_messages = [
         message.content
         for message in second_turn_messages
-        if message.role == "system" and "working_checkpoint" in message.content
+        if message.role == "system" and "<agent_status" in message.content
     ]
-    assert checkpoint_messages == [
-        "<working_checkpoint>\n必须先读文件\n相关 SOP：coding\n</working_checkpoint>"
-    ]
+    assert len(checkpoint_messages) == 1
+    assert 'revision="1"' in checkpoint_messages[0]
+    assert "key_info: 必须先读文件" in checkpoint_messages[0]
+    assert "related_sop: coding" in checkpoint_messages[0]
+    assert not any(
+        message.content.startswith("<working_checkpoint>")
+        for message in second_turn_messages
+    )

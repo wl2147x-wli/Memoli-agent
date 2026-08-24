@@ -81,9 +81,11 @@ class SkillRuntime:
             versions = [
                 version
                 for binding in bindings
-                if (version := self.repository.get_bound_version(
-                    session_instance_id, binding.name
-                ))
+                if (
+                    version := self.repository.get_bound_version(
+                        session_instance_id, binding.name
+                    )
+                )
                 is not None
             ]
             return self._render_catalog(versions)

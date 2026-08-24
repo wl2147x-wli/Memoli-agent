@@ -238,3 +238,4 @@ workspace/benchmark/
 benchmark-results/
 vendor-local/
 third_party_local/
+.pytest_basetemp/

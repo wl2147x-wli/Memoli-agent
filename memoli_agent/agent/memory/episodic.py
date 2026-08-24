@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from memoli_agent.agent.memory.models import MemoryScope
+from memoli_agent.agent.memory.source import MemoryContentPolicy
 from memoli_agent.agent.memory.sqlite_store import SQLiteMemoryStore
 from memoli_agent.agent.trajectory import SQLiteTrajectoryStore
 
@@ -26,6 +27,9 @@ class EpisodicSegment:
     segmenter_version: str = "2"
     content_hash: str = ""
     source_refs: tuple[dict[str, Any], ...] = ()
+    sensitivity: str = "private"
+    prompt_allowed: bool = True
+    embedding_allowed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,7 @@ class TrajectorySegmentIndexer:
     segmenter_version: str = "2"
     max_segment_chars: int = 4_000
     max_prefix_chars: int = 1_000
+    policy: MemoryContentPolicy = MemoryContentPolicy()
 
     async def project_trace(
         self,
@@ -99,9 +104,13 @@ class TrajectorySegmentIndexer:
             content_hash = hashlib.sha256(
                 " ".join(search_text.casefold().split()).encode("utf-8")
             ).hexdigest()
-            segment_id = "seg_" + hashlib.sha256(
-                f"{trace_id}:{ordinal}:{self.segmenter_version}".encode()
-            ).hexdigest()[:24]
+            sensitivity = self.policy.classify(content)
+            segment_id = (
+                "seg_"
+                + hashlib.sha256(
+                    f"{trace_id}:{ordinal}:{self.segmenter_version}".encode()
+                ).hexdigest()[:24]
+            )
             source_refs = tuple(item.reference for item in chunk)
             segment = EpisodicSegment(
                 segment_id=segment_id,
@@ -116,6 +125,9 @@ class TrajectorySegmentIndexer:
                 segmenter_version=self.segmenter_version,
                 content_hash=content_hash,
                 source_refs=source_refs,
+                sensitivity=sensitivity,
+                prompt_allowed=self.policy.prompt_allowed(sensitivity),
+                embedding_allowed=self.policy.embedding_allowed(sensitivity),
             )
             segments.append(segment)
             rows.append(
@@ -133,6 +145,9 @@ class TrajectorySegmentIndexer:
                     "source_refs_json": json.dumps(
                         source_refs, ensure_ascii=False, sort_keys=True
                     ),
+                    "sensitivity": sensitivity,
+                    "prompt_allowed": self.policy.prompt_allowed(sensitivity),
+                    "embedding_allowed": self.policy.embedding_allowed(sensitivity),
                 }
             )
         self.memory.replace_trajectory_segments(trace_id, rows)
@@ -157,9 +172,7 @@ class TrajectorySegmentIndexer:
         messages = data.get("messages", []) if isinstance(data, dict) else []
         return str(messages[segment.start_event_id]["content"])
 
-    async def backfill(
-        self, scope: MemoryScope, *, limit: int = 100
-    ) -> dict[str, int]:
+    async def backfill(self, scope: MemoryScope, *, limit: int = 100) -> dict[str, int]:
         traces = await self.trajectory.query_traces()
         completed = projected = 0
         for trace in traces[:limit]:
@@ -172,9 +185,7 @@ class TrajectorySegmentIndexer:
 
     async def _fragments(self, bundle: dict[str, Any]) -> list[_Fragment]:
         fragments: list[_Fragment] = []
-        root = next(
-            (span for span in bundle["spans"] if span["kind"] == "agent"), None
-        )
+        root = next((span for span in bundle["spans"] if span["kind"] == "agent"), None)
         if root is not None:
             data = await self._payload(bundle, root.get("input_payload_id"))
             if isinstance(data, dict):
@@ -267,9 +278,7 @@ class TrajectorySegmentIndexer:
                 if int(item["sequence"]) == int(reference["sequence"])
             )
             payload = await self._payload(bundle, event.get("payload_id"))
-            return str(
-                payload.get("raw_content") or payload.get("model_content") or ""
-            )
+            return str(payload.get("raw_content") or payload.get("model_content") or "")
         if kind == "trace-final":
             return str(
                 await self._payload(

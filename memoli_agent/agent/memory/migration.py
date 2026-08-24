@@ -88,9 +88,7 @@ class LegacyMemoryMigrator:
             return [], 0
         entries: list[tuple[str, str]] = []
         malformed = 0
-        for number, raw in enumerate(
-            raw_bytes.decode("utf-8").splitlines(), 1
-        ):
+        for number, raw in enumerate(raw_bytes.decode("utf-8").splitlines(), 1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -117,9 +115,7 @@ class LegacyMemoryMigrator:
             digest.update(snapshot[name] or b"<missing>")
         return digest.hexdigest()
 
-    def _backup(
-        self, manifest_hash: str, snapshot: dict[str, bytes | None]
-    ) -> Path:
+    def _backup(self, manifest_hash: str, snapshot: dict[str, bytes | None]) -> Path:
         target = self.root / "legacy-backups" / manifest_hash[:16]
         target.mkdir(parents=True, exist_ok=True)
         for name in _LEGACY_FILES:
@@ -139,9 +135,7 @@ class LegacyMemoryMigrator:
     def _snapshot(self) -> dict[str, bytes | None]:
         return {
             name: (
-                (self.root / name).read_bytes()
-                if (self.root / name).exists()
-                else None
+                (self.root / name).read_bytes() if (self.root / name).exists() else None
             )
             for name in _LEGACY_FILES
         }

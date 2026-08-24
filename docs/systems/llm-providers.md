@@ -1,5 +1,7 @@
 # LLM Providers
 
+每个模型 Profile 同时声明 `context_window_tokens`、`context_safety_margin_tokens` 和 `token_estimator`。Runtime 在 Provider 前基于完整 messages、tools、输出预留及协议开销统一预算；KV cache 由 Provider 管理，Runtime 只稳定前缀并记录实际返回的 cache usage。详见 [Context Management](context-management.md)。
+
 Memoli 通过一个无厂商 SDK 类型的异步合同接入 OpenAI Chat Completions、
 OpenAI-compatible 服务和 Anthropic Messages。Provider 只完成协议转换、流式组装、
 错误分类和有界重试；Session history、system prompt、工具执行与轨迹提交仍由 Runtime
@@ -35,7 +37,7 @@ api_key = "${MEMOLI_LLM_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 dialect = "deepseek"
 max_retries = 1
-stream = false
+stream = true
 ```
 
 `api_key` 是正式配置入口，可以直接填写，也可以写成完整占位符

@@ -17,41 +17,42 @@ from memoli_agent.agent.skills.models import SkillCatalog
 from memoli_agent.agent.tools.builtin import TimeTool
 from memoli_agent.agent.tools.registry import ToolRegistry
 from memoli_agent.agent.trajectory import InMemoryTrajectoryStore
-from memoli_agent.agent.types import ContextRequest, TurnState
+from memoli_agent.agent.types import ChatMessage, ContextRequest, TurnState
 from memoli_agent.bus.events import InboundMessage, OutboundMessage
 from memoli_agent.bus.queue import MessageBus
 
 
-def test_session_isolation_history_window_and_context_block_order() -> None:
-    manager = SessionManager(history_window=2)
+def test_session_isolation_uses_recent_turns_and_context_block_order() -> None:
+    """§3.1：Session 不再维护消息历史；跨轮近期 turn 由 ContextRequest.recent_turns
+    注入，各 Session 独立、block 顺序稳定。"""
+
+    manager = SessionManager()
     first = manager.get_or_create("cli:first")
     second = manager.get_or_create("cli:second")
-    first.add_user_message("old")
-    first.add_assistant_message("recent answer")
-    first.add_user_message("recent question")
-
-    assert [item.content for item in first.get_history()] == [
-        "recent answer",
-        "recent question",
-    ]
-    assert second.get_history() == []
+    # Session 不再有消息历史 API；近期 turn 由 canonical committed turn 提供，
+    # 此处以 recent_turns 模拟 CrossTurnContextPhase 注入的跨轮上下文。
+    assert not hasattr(first, "get_history")
+    assert not hasattr(second, "get_history")
+    recent = (
+        ChatMessage("assistant", "recent answer"),
+        ChatMessage("user", "recent question"),
+    )
 
     inbound = InboundMessage("cli", "first", "user", "current")
     rendered = ContextBuilder("Memoli", "system").render(
         ContextRequest(
-            TurnState(inbound.session_key, inbound, first),
-            "Memoli",
-            "system",
+            turn_state=TurnState(inbound.session_key, inbound, first),
+            agent_name="Memoli",
+            system_prompt="system",
             skill_catalog_prompt_block="skill-budgeted",
             memory_prompt_block="memory-budgeted",
-            working_prompt_block="working-budgeted",
+            recent_turns=recent,
         )
     )
     assert [message.content for message in rendered.messages] == [
         "system",
         "skill-budgeted",
         "memory-budgeted",
-        "working-budgeted",
         "recent answer",
         "recent question",
         "current",
@@ -111,7 +112,7 @@ def test_deterministic_inbound_to_outbound_e2e() -> None:
     trajectory = InMemoryTrajectoryStore()
     registry = ToolRegistry()
     registry.register(TimeTool())
-    sessions = SessionManager(history_window=4)
+    sessions = SessionManager()
     pipeline = PassiveTurnPipeline(
         session_manager=sessions,
         context_builder=ContextBuilder("Memoli", "system"),
@@ -139,10 +140,12 @@ def test_deterministic_inbound_to_outbound_e2e() -> None:
     outbound = asyncio.run(scenario())
     assert outbound.content == "已结合记忆、Skill 和工具完成。"
     assert outbound.metadata["trace_id"]
-    assert [item.role for item in sessions.get_or_create("cli:e2e").get_history()] == [
-        "user",
-        "assistant",
-    ]
+    # §3.1：跨轮事实改由 canonical committed turn 持久化（InMemoryTrajectoryStore
+    # 实现 CommittedTurnStore → 记录），不再写入 Session 消息历史。
+    assert not hasattr(sessions.get_or_create("cli:e2e"), "get_history")
+    event_types = [event.event_type for event in trajectory.events]
+    assert "turn_input_committed" in event_types
+    assert "turn_output_committed" in event_types
     assert any(event.event_type == "tool_finished" for event in trajectory.events)
     first_context = [message.content for message in provider.calls[0]]
     assert any("available_skills" in content for content in first_context)

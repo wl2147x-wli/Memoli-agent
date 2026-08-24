@@ -141,10 +141,7 @@ class SubAgentManager:
             )
         if request.max_iterations is not None and request.max_iterations <= 0:
             raise ValueError("max_iterations 必须大于 0")
-        if (
-            request.max_elapsed_seconds is not None
-            and request.max_elapsed_seconds <= 0
-        ):
+        if request.max_elapsed_seconds is not None and request.max_elapsed_seconds <= 0:
             raise ValueError("max_elapsed_seconds 必须大于 0")
         for dependency_id in request.dependency_ids:
             dependency = self.repository.get_task(dependency_id)
@@ -202,9 +199,7 @@ class SubAgentManager:
     def list_tasks(self, root_session_key: str = "") -> list[AgentTask]:
         return self.repository.list_tasks(root_session_key)
 
-    def describe_task(
-        self, task_id: str, root_session_key: str = ""
-    ) -> dict[str, Any]:
+    def describe_task(self, task_id: str, root_session_key: str = "") -> dict[str, Any]:
         """返回稳定、会话隔离的任务管理视图。"""
 
         task = self._owned_task(task_id, root_session_key)
@@ -392,9 +387,7 @@ class SubAgentManager:
                 result = await self.runtime.run(runtime_task)
             except asyncio.CancelledError:
                 target = (
-                    TaskStatus.INTERRUPTED
-                    if self._stopping
-                    else TaskStatus.CANCELLED
+                    TaskStatus.INTERRUPTED if self._stopping else TaskStatus.CANCELLED
                 )
                 self.repository.transition(
                     task_id,

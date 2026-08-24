@@ -40,6 +40,24 @@ class MemoryRuntime:
     index_worker: Any = None
     card_builder: Any = None
     episode_projector: Any = None
+    offline_worker: Any = None
+    offline_enabled: bool = False
+    extractor_fingerprint: str = ""
+    governance_service: Any = None
+    retrieval_mode: str = "auto"
+    detail_level: str = "summary"
+    card_statement_limit: int = 6
+    claim_expansion_limit: int = 6
+    evidence_expansion_limit: int = 3
+    direct_claim_fallback: bool = True
+
+    async def start(self) -> None:
+        if self.offline_worker is not None:
+            await self.offline_worker.start()
+
+    async def stop(self) -> None:
+        if self.offline_worker is not None:
+            await self.offline_worker.stop()
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         """按关键词查询长期记忆。"""
@@ -69,6 +87,12 @@ class MemoryRuntime:
             truncated=len(items) < len(result.items) or result.truncated,
             omitted_items=(len(result.items) - len(items)) + result.omitted_items,
             omitted_chars=omitted_chars + result.omitted_chars,
+            requested_route=result.requested_route,
+            actual_route=result.actual_route,
+            detail_level=result.detail_level,
+            degraded_reasons=result.degraded_reasons,
+            query_plan_summary=dict(result.query_plan_summary),
+            filter_counts=dict(result.filter_counts),
         )
 
     async def pre_recall(
@@ -96,6 +120,12 @@ class MemoryRuntime:
             episode_limit=self.episode_limit,
             max_chars=self.recall_chars,
             spillover_order=self.spillover_order,
+            retrieval_mode=self.retrieval_mode,  # type: ignore[arg-type]
+            detail_level=self.detail_level,  # type: ignore[arg-type]
+            card_statement_limit=self.card_statement_limit,
+            claim_expansion_limit=self.claim_expansion_limit,
+            evidence_expansion_limit=self.evidence_expansion_limit,
+            direct_claim_fallback=self.direct_claim_fallback,
         )
         recalled = await self.query(request)
         core = (
@@ -123,6 +153,12 @@ class MemoryRuntime:
             truncated=recalled.truncated,
             omitted_items=recalled.omitted_items,
             omitted_chars=recalled.omitted_chars,
+            requested_route=recalled.requested_route,
+            actual_route=recalled.actual_route,
+            detail_level=recalled.detail_level,
+            degraded_reasons=recalled.degraded_reasons,
+            query_plan_summary=dict(recalled.query_plan_summary),
+            filter_counts=dict(recalled.filter_counts),
         )
 
     async def mutate(self, request: MemoryMutation) -> MemoryItem:
@@ -155,8 +191,77 @@ class MemoryRuntime:
         )
         return {"status": "ready", "segments": len(segments)}
 
+    def schedule_completed_trace(
+        self,
+        trace_id: str,
+        *,
+        objective: str = "",
+        current_step: str = "",
+        scope: MemoryScope | None = None,
+    ) -> dict[str, Any]:
+        if self.episode_projector is None or not trace_id:
+            return {"status": "disabled"}
+        self.store.enqueue_episode_projection(
+            trace_id,
+            scope or MemoryScope(),
+            objective=objective,
+            current_step=current_step,
+        )
+        if self.offline_worker is not None:
+            self.offline_worker.wake()
+        return {"status": "scheduled", "trace_id": trace_id}
+
+    async def request_long_term_update(
+        self,
+        *,
+        trace_id: str,
+        session_id: str,
+        idempotency_key: str,
+        scope: MemoryScope | None = None,
+    ) -> Any:
+        selected_scope = scope or MemoryScope()
+        coordinator_enabled = bool(
+            self.offline_worker is not None
+            and self.offline_worker.auto_scan_enabled
+            and self.offline_worker.trigger_coordinator is not None
+        )
+        if (
+            not self.offline_enabled
+            or not coordinator_enabled
+            or not hasattr(self.store, "create_update_intent")
+        ):
+            return {
+                "status": "disabled",
+                "reason": (
+                    "trigger-coordinator-disabled"
+                    if self.offline_enabled
+                    else "offline-consolidation-disabled"
+                ),
+                "pending_chat_count": 0,
+            }
+        pending = self.store.pending_chat_consumptions(selected_scope, session_id)
+        boundary_key = (
+            f"{pending[0].trace_id}:{pending[-1].trace_id}:{len(pending)}"
+            if pending
+            else "empty"
+        )
+        intent = self.store.create_update_intent(
+            selected_scope, session_id, boundary_key
+        )
+        if self.offline_worker is not None:
+            self.offline_worker.wake()
+        return {
+            "status": "waiting-for-trigger",
+            "hint_id": intent.hint_id,
+            "scope": selected_scope,
+            "pending_chat_count": len(pending),
+        }
+
     async def maintenance_tick(self) -> dict[str, Any]:
         """串行执行一个有界维护批次，不创建并发 agent turn。"""
+
+        if self.offline_worker is not None:
+            return await self.offline_worker.maintenance_tick()
 
         diagnostics: dict[str, Any] = {}
         if self.card_builder is not None:
@@ -169,12 +274,29 @@ class MemoryRuntime:
                 "succeeded": result.succeeded,
                 "failed": result.failed,
                 "stale": result.stale,
+                "policy_filtered": result.policy_filtered,
             }
         return diagnostics
 
     def diagnostics(self) -> dict[str, Any]:
+        if self.offline_worker is not None:
+            return {
+                **dict(self.store.index_diagnostics()),
+                "offline": self.offline_worker.diagnostics(),
+            }
         if hasattr(self.store, "index_diagnostics"):
-            return dict(self.store.index_diagnostics())
+            return {
+                **dict(self.store.index_diagnostics()),
+                "offline": {
+                    "enabled": self.offline_enabled,
+                    "running": False,
+                    **(
+                        self.store.offline_diagnostics()
+                        if hasattr(self.store, "offline_diagnostics")
+                        else {}
+                    ),
+                },
+            }
         return {"engine": "markdown", "semantic_entries": 0}
 
     def render_prompt_block(self, result: MemoryQueryResult) -> str:

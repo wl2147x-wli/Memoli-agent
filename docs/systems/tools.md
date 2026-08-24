@@ -16,7 +16,7 @@ Skill Runtime 关闭时，默认模型可见集合固定为九个工具：
 | `file_write` | 显式覆盖、追加或前插文本 |
 | `update_working_checkpoint` | 替换当前会话的短期任务便笺 |
 | `ask_user` | 以 `needs-user` 暂停并请求用户输入 |
-| `start_long_term_update` | 创建 `pending` 的长期整理请求 |
+| `start_long_term_update` | 保存 `waiting-for-trigger` 整理 hint，不直接提取 |
 | `time` | 查询本地和 UTC 时间 |
 | `memory_recall` | 检索已有长期记忆 |
 
@@ -27,8 +27,11 @@ Skill Runtime 关闭时，默认模型可见集合固定为九个工具：
 - `memory_write` 不再默认暴露；未经处理的轨迹不能直接成为长期事实。
 - `spawn_subagent` 设置 `tools.subagent_tool_enabled = true` 后才附加注册。
 
-工具数量很小时不启用主动发现，`tool_search_enabled` 默认关闭。MCP 或插件工具
-规模增长后的按需发现应由独立 OpenSpec change 设计。
+工具数量很小时不启用主动发现，`tool_search_enabled` 默认关闭，此时全部启用工具按
+名称稳定排序并进入完整 schema snapshot。启用后，基础工具与 `tool_search` 先组成
+稳定前缀；后续插件、MCP 或其他延迟注册工具由 `tool_search` 返回有界、确定性候选，
+仅选中的完整 schema 会被披露并冻结。引用或发现结果不会扩大原工具权限，安全撤销
+仍然 fail closed。详见 [Context Management](context-management.md)。
 
 启用 `[skills].enabled=true` 且 Skill Registry 装配成功时，额外注册第十个只读
 工具 `skill_load(name, reference?)`。它对应 GenericAgent 的 L1 紧凑目录与 L3
@@ -84,6 +87,39 @@ workspace 文件边界。
 实际执行参数、时序、错误、完整脱敏输出和返回模型的有界输出。副作用工具执行前
 先提交意图；必需轨迹写入失败时不执行副作用。
 
+超过模型 preview 预算的结果会先按 trajectory 脱敏策略写入受管 payload，再向模型
+返回带 hash、大小、转换标志和稳定引用的冻结预览（`FrozenToolPreview`）。预览绑定
+`conversation_epoch`、规范化 tool message hash 与 `tool_call_id`；稳定快照键为
+`(session_key, conversation_epoch)`，新 epoch 取新快照与新预览，不复用旧 epoch 派生索引。
+恢复时必须按 `(session_key, conversation_epoch, tool_call_id)` 取冻结预览并校验 preview hash、
+canonical message hash、payload reference 与 `tool_call_id`；任一不一致时排除整
+个旧 turn 或可观察协议错误结束，绝不拆散 assistant tool call 与 tool result 配对，
+也不重新生成预览。相同 Session 重编译或恢复时复用同一预览；稳定引用本身不是文件
+读取能力，重新读取仍经过 workspace/scope/tool 权限。
+
+能力安全撤销采用 fail-closed：撤销立即阻止已撤销工具的执行，并使当前 snapshot
+进入失效状态（记录 `invalidated_reason`），编译拒绝向模型宣称已撤销工具仍可用；
+恢复需新 epoch 重新冻结当前 schema。`/clear` 在没有活动 turn 时原子创建新 epoch
+并重置派生 context 状态（编译快照、frontier、失败计数、冻结预览可见索引）；旧
+committed turn、原始 trajectory、受管 payload、长期记忆与 working-state 按各自
+策略保留但不进入新 epoch 上下文——`/clear` 不隐式删除 payload，仅把早于新 epoch
+的冻结预览派生索引标记不可见/清理。
+
 原始事件不包含 reward、Rubric、成功标签、正确工具标签、失败归因或 SFT/RL
 标签，也不会自动进入 Memory、Evolution 或 Post-training。轨迹清洗、评价和训练
 样本生成必须从 SQLite 只读副本派生，并保持原始事件不变。
+## Memory learning and review
+
+`start_long_term_update` persists an idempotent session/unconsumed-boundary hint,
+wakes the Trigger Coordinator, returns `waiting-for-trigger`, hint ID and pending
+chat count, and never creates a runnable extraction request by itself.
+`memory_recall` accepts `retrieval_mode`, `detail_level`,
+statement IDs, and statement/Claim/Evidence expansion limits, and returns requested
+and actual routes plus degradation diagnostics.
+
+`memory_manage` supports Candidate `list`, `show`, `approve`, `reject`, and `review`
+operations and long-term request list/status/retry/cancel diagnostics. Approve and
+reject require an explicit instruction in the current user message; the ordinary
+assistant, extractor, and worker cannot act as an approval subject.
+Governance dead-letter retry and consolidation retry/suppress are conditional service
+operations. Operator force-release is intentionally absent from model-visible tools.

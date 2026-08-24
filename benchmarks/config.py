@@ -50,6 +50,9 @@ class MetricsConfig:
     include_retrieval_recall: bool = True
     judge_enabled: bool = False
     judge_model: str = "gpt-4o-mini"
+    # 可选：记忆学习分层评估（候选有效率/激活率/遵循率/留出增益）。
+    # 未启用时不影响 LoCoMo/LongMemEval 官方评分。
+    layered_memory: bool = False
 
 
 @dataclass(slots=True)

@@ -52,6 +52,11 @@ class TurnResult:
     usage: dict[str, Any] = field(default_factory=dict)
     fallback_used: bool = False
     error_type: str | None = None
+    # 跨轮 committed turn 状态：0 表示未记录（轨迹关闭/不支持 committed turn）。
+    # phases 层据此续写 turn_output_committed（§2.3）。
+    committed_epoch: int = 0
+    committed_turn_seq: int = 0
+    committed_output_seq: int = 0
 
     def __post_init__(self) -> None:
         if self.iterations < 0:

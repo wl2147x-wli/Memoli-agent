@@ -26,6 +26,9 @@ class ProviderTarget:
     provider: LLMProvider
     capabilities: ModelCapabilities
     max_output_tokens: int = 8192
+    context_window_tokens: int = 131_072
+    context_safety_margin_tokens: int = 4_096
+    token_estimator: str = "conservative"
     temperature: float | None = None
 
 

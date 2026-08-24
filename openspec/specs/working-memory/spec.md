@@ -5,7 +5,7 @@ TBD - created by archiving change build-evidence-backed-memory-system. Update Pu
 ## Requirements
 ### Requirement: Hybrid working-state projection
 
-系统 SHALL 为当前任务维护由 Harness 确定性硬状态和 Agent 语义 checkpoint 组成的工作记忆，并 SHALL 在模型可见表示中区分两类来源。
+系统 SHALL 为当前任务维护由 Harness 确定性硬状态和 Agent 语义 checkpoint 组成的工作记忆，并 SHALL 在模型可见表示中区分两类来源；Agent checkpoint 的目标、步骤、下一行动、关键内容、约束、决策、相关 SOP 和 Agent 声明产物 SHALL 与 Runtime 验证状态明确分区。
 
 #### Scenario: Tool execution updates deterministic state
 
@@ -16,23 +16,30 @@ TBD - created by archiving change build-evidence-backed-memory-system. Update Pu
 #### Scenario: Agent provides a semantic checkpoint
 
 - **WHEN** `update_working_checkpoint` 提交目标、约束、当前步骤、进展、关键发现、失败方案、下一步或相关资源
-- **THEN** 系统 SHALL 更新当前任务的语义 checkpoint
-- **AND** SHALL 将其标识为 Agent 提供的工作信息而不是已验证运行事实
+- **THEN** 系统 SHALL 更新当前任务的完整语义 checkpoint，并在后续模型状态中保留已提交的非空字段
+- **AND** SHALL 将 Agent 声明的决策和产物标识为 Agent 提供的工作信息而不是已验证运行事实
 
 ### Requirement: Direct latest-state injection
 
-系统 SHALL 在当前任务的每次模型决策前直接注入最新工作状态，而 SHALL NOT 通过关键词或语义相似度检索决定是否提供工作记忆。
+系统 SHALL 在当前任务的每次模型决策前直接注入最新工作状态，而 SHALL NOT 通过关键词或语义相似度检索决定是否提供工作记忆；初始 Prompt 组合阶段 SHALL NOT 预置遗留或简化的工作状态文本。
 
 #### Scenario: Tool result requires another model decision
 
 - **WHEN** Agent Loop 已执行工具并准备下一次 Provider 调用
 - **THEN** 下一次模型可见上下文 SHALL 包含工具结果之后计算的最新工作状态
-- **AND** SHALL 只包含一个明确标识为最新版本的工作状态块
+- **AND** SHALL 只包含一个明确标识为最新版本的 `<agent_status>` 工作状态块，不得同时包含遗留 `<working_checkpoint>` 块
 
 #### Scenario: Provider retry or fallback occurs
 
 - **WHEN** Runtime 重试模型调用或切换到 fallback Provider
 - **THEN** 重试或 fallback 请求 SHALL 接收与当前已提交运行状态一致的工作状态投影
+- **AND** 每次实际请求 SHALL 从同一调用前装配路径重新建立唯一状态块
+
+#### Scenario: No checkpoint exists yet
+
+- **WHEN** 工作记忆启用但当前 scope 尚未创建 Agent checkpoint
+- **THEN** 模型可见状态 SHALL 仍包含 Runtime 硬状态和明确的 Agent checkpoint unavailable 标记
+- **AND** SHALL NOT 创建空 checkpoint 或注入遗留简化块
 
 ### Requirement: Bounded and precedence-aware status rendering
 
@@ -98,3 +105,62 @@ TBD - created by archiving change build-evidence-backed-memory-system. Update Pu
 - **THEN** 原始轨迹 SHALL 能区分更新意图、提交结果和后续模型实际可见的状态版本
 - **AND** SHALL NOT 为该状态附加 reward、正确性标签或训练标签
 
+### Requirement: User-inspectable working-state snapshot
+
+系统 SHALL 为授权的本地 CLI 提供当前 session 的只读工作状态快照，并 SHALL 在结构和人类可读表示中明确区分 Agent 维护的语义 checkpoint 与 Runtime 根据真实执行投影的硬状态。
+
+#### Scenario: Active checkpoint is inspected during a task
+
+- **WHEN** CLI 查询当前 session 且存在 active checkpoint
+- **THEN** 快照 SHALL 包含 session key、objective、current step、next action、key info、constraints、decisions、artifacts、related SOP、revision、状态、stale 标记和更新时间
+- **AND** Runtime 状态 SHALL 独立包含可验证的 iteration、elapsed、last tool、last tool status 和 artifacts
+
+#### Scenario: Checkpoint and runtime projection disagree
+
+- **WHEN** Agent checkpoint 声称任务已完成但 Runtime 状态没有相应完成证据
+- **THEN** 快照 SHALL 保留两种来源及其原始状态并明确标识信任来源
+- **AND** SHALL NOT 使用 Agent 字段覆盖或推导 Runtime 硬状态
+
+#### Scenario: Checkpoint content exceeds terminal budget
+
+- **WHEN** 工作 checkpoint 超过人类可读终端表示的预算
+- **THEN** 渲染器 SHALL 优先保留 session、revision、状态、stale、目标、当前步骤、下一步和用户约束
+- **AND** SHALL 明确标识省略内容而不是静默截断成看似完整的卡片
+
+### Requirement: Non-mutating checkpoint inspection
+
+工作状态检查 SHALL 读取最近已提交的 checkpoint 快照，不得更新 revision、恢复 stale 状态、改变生命周期或产生模型与工具行为。
+
+#### Scenario: Stale or completed checkpoint is inspected
+
+- **WHEN** CLI 查询 stale 或 completed checkpoint
+- **THEN** 系统 SHALL 返回该状态和最近已提交 revision
+- **AND** SHALL NOT 自动将 checkpoint 改回 active 或写入新的 revision
+
+#### Scenario: No checkpoint exists
+
+- **WHEN** 当前 session 尚未提交 checkpoint
+- **THEN** 系统 SHALL 返回明确的 not-found/unavailable 表示
+- **AND** SHALL NOT 根据聊天历史、长期记忆或模型输出伪造 checkpoint
+
+#### Scenario: Inspection occurs while a checkpoint update commits
+
+- **WHEN** CLI 查询与 checkpoint 更新在时间上重叠
+- **THEN** 查询 SHALL 返回一个完整已提交 revision 或可重试的受控忙碌状态
+- **AND** SHALL NOT 返回跨 revision 拼接的部分字段
+
+### Requirement: Stable checkpoint presentation contract
+
+工作状态快照 SHALL 具有稳定、带版本的人类可读和 JSON 表示，使 CLI、未来 TUI 与桌面客户端可共享相同语义而不解析模型注入用 XML。
+
+#### Scenario: Human-readable card is rendered
+
+- **WHEN** CLI 请求默认 checkpoint 表示
+- **THEN** 系统 SHALL 以字段化工作卡片显示 checkpoint，并将 Runtime 硬状态放在独立区域
+- **AND** SHALL NOT 直接把模型上下文中的 `<working_checkpoint>` 或 `<agent_status>` 文本当作 UI 合同
+
+#### Scenario: Machine-readable snapshot is rendered
+
+- **WHEN** 调用者请求 JSON 表示
+- **THEN** 输出 SHALL 包含 presentation schema version、session key、availability、checkpoint 和 runtime status 字段
+- **AND** 相同已提交快照的规范化 JSON 字段语义 SHALL 保持稳定

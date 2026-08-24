@@ -173,8 +173,7 @@ class TaskGraphRepository:
         started_at = now if target is TaskStatus.RUNNING else task.started_at
         finished_at = (
             now
-            if target
-            in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            if target in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
             else task.finished_at
         )
         with self._lock, self._connection:
@@ -196,9 +195,7 @@ class TaskGraphRepository:
                         ensure_ascii=False,
                     ),
                     error_type if error_type is not None else task.error_type,
-                    error_message
-                    if error_message is not None
-                    else task.error_message,
+                    error_message if error_message is not None else task.error_message,
                     reason,
                     started_at,
                     finished_at,

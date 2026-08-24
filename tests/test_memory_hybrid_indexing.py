@@ -18,9 +18,10 @@ from memoli_agent.agent.memory.cards import (
 )
 from memoli_agent.agent.memory.episodic import TrajectorySegmentIndexer
 from memoli_agent.agent.memory.hybrid import (
+    FtsSearchLane,
     HybridMemoryRetriever,
-    KeywordSearchLane,
     MetadataSearchLane,
+    PatternSearchLane,
     SemanticSearchLane,
 )
 from memoli_agent.agent.memory.models import (
@@ -121,6 +122,90 @@ def test_index_worker_is_idempotent_and_versioned(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_embedding_version_switch_replaces_old_index(tmp_path: Path) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.db")
+    item = store.append_claim(_claim("semantic version switch"))
+    first = DeterministicEmbedder(dimensions=8, version="v1")
+    second = DeterministicEmbedder(dimensions=8, version="v2")
+
+    async def scenario() -> None:
+        assert (await MemoryIndexWorker(store, first).tick()).succeeded == 1
+        assert store.rebuild_index_jobs("claim") == 1
+        assert (await MemoryIndexWorker(store, second).tick()).succeeded == 1
+        assert store.ready_semantic_rows(
+            MemoryQuery("semantic"),
+            model=first.model,
+            version=first.version,
+            dimensions=first.dimensions,
+            limit=10,
+        ) == []
+        rows = store.ready_semantic_rows(
+            MemoryQuery("semantic"),
+            model=second.model,
+            version=second.version,
+            dimensions=second.dimensions,
+            limit=10,
+        )
+        assert [row[0].item_id for row in rows] == [item.item_id]
+
+    asyncio.run(scenario())
+    versions = store._connection.execute(  # noqa: SLF001
+        "SELECT embedding_version FROM semantic_index ORDER BY embedding_version"
+    ).fetchall()
+    assert [row[0] for row in versions] == ["v2"]
+
+
+def test_experimental_v5_index_is_collapsed_to_latest_version(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(database)
+    item = store.append_claim(_claim("collapse old semantic versions"))
+
+    async def index_first() -> None:
+        embedder = DeterministicEmbedder(dimensions=8, version="v1")
+        assert (await MemoryIndexWorker(store, embedder).tick()).succeeded == 1
+
+    asyncio.run(index_first())
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        DROP INDEX semantic_index_version;
+        ALTER TABLE semantic_index RENAME TO semantic_index_v4;
+        CREATE TABLE semantic_index (
+            memory_type TEXT NOT NULL, memory_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL, embedding_model TEXT NOT NULL,
+            embedding_version TEXT NOT NULL, dimensions INTEGER NOT NULL,
+            vector_blob BLOB NOT NULL, indexed_at TEXT NOT NULL,
+            PRIMARY KEY(memory_type, memory_id, embedding_model, embedding_version)
+        );
+        INSERT INTO semantic_index SELECT * FROM semantic_index_v4;
+        DROP TABLE semantic_index_v4;
+        CREATE INDEX semantic_index_version ON semantic_index(
+            embedding_model, embedding_version, dimensions, memory_type
+        );
+        PRAGMA user_version = 5;
+        """
+    )
+    current = connection.execute(
+        "SELECT memory_type, memory_id, content_hash, embedding_model, dimensions, "
+        "vector_blob FROM semantic_index"
+    ).fetchone()
+    assert current is not None
+    connection.execute(
+        "INSERT INTO semantic_index VALUES (?, ?, ?, ?, 'v2', ?, ?, ?)",
+        (*current, "9999-12-31T23:59:59+00:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteMemoryStore(database)
+    rows = migrated._connection.execute(  # noqa: SLF001
+        "SELECT memory_id, embedding_version FROM semantic_index"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(item.item_id, "v2")]
+    assert migrated.index_diagnostics()["schema_version"] == 7
+
+
 @dataclass(frozen=True)
 class _FailingEmbedder:
     model: str = "failed"
@@ -130,6 +215,18 @@ class _FailingEmbedder:
 
     async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         raise TimeoutError("secret provider response")
+
+
+@dataclass(frozen=True)
+class _PartiallyInvalidEmbedder:
+    model: str = "partial"
+    version: str = "1"
+    dimensions: int = 4
+    enabled: bool = True
+
+    async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        assert len(texts) == 2
+        return ((1.0, 0.0, 0.0, 0.0), (1.0, 0.0))
 
 
 def test_index_failure_keeps_source_and_records_safe_retry(tmp_path: Path) -> None:
@@ -147,6 +244,28 @@ def test_index_failure_keeps_source_and_records_safe_retry(tmp_path: Path) -> No
         (item.item_id,),
     ).fetchone()
     assert (row["state"], row["last_error"]) == ("retry", "TimeoutError")
+
+
+def test_batch_index_publishes_valid_items_and_isolates_invalid_vector(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.db")
+    store.append_claim(_claim("first batch source"))
+    store.append_claim(_claim("second batch source"))
+
+    async def scenario() -> None:
+        result = await MemoryIndexWorker(
+            store, _PartiallyInvalidEmbedder(), batch_size=2
+        ).tick()
+        assert (result.processed, result.succeeded, result.failed) == (2, 1, 1)
+
+    asyncio.run(scenario())
+    assert store.index_diagnostics()["semantic_entries"] == 1
+    assert store.index_diagnostics()["index_jobs"] == {
+        "dead-letter": 1,
+        "ready": 1,
+    }
+    assert len(store.search(MemoryQuery("batch source")).items) == 2
 
 
 def test_openai_embedder_requires_environment_key(
@@ -176,9 +295,10 @@ def test_hybrid_rrf_deduplicates_budgets_and_is_deterministic(tmp_path: Path) ->
     worker = MemoryIndexWorker(store, embedder, batch_size=10)
     retriever = HybridMemoryRetriever(
         store,
-        KeywordSearchLane(store),
-        MetadataSearchLane(store),
-        SemanticSearchLane(store, embedder),
+        fts_lane=FtsSearchLane(store),
+        pattern_lane=PatternSearchLane(store),
+        metadata_lane=MetadataSearchLane(store),
+        semantic_lane=SemanticSearchLane(store, embedder),
         candidate_limit=20,
     )
 
@@ -200,7 +320,11 @@ def test_hybrid_rrf_deduplicates_budgets_and_is_deterministic(tmp_path: Path) ->
         assert len({item.item_id for item in first_result.items}) == len(
             first_result.items
         )
-        assert {item.item_type for item in first_result.items} == {"card", "claim"}
+        types = {item.item_type for item in first_result.items}
+        # 新的 FTS/Pattern 通道把 Card 召回为 statement；
+        # 混合结果含 claim 与一张 card 系命中。
+        assert "claim" in types
+        assert any(item_type.startswith("card") for item_type in types)
         assert "semantic" in first_result.active_lanes
         assert first_result.query_context_fields == ("query",)
         assert first_result.injected_chars <= 100
@@ -214,9 +338,10 @@ def test_hybrid_semantic_failure_and_spillover_are_bounded(tmp_path: Path) -> No
     item = store.append_claim(_claim("关键词通道保持可用"))
     retriever = HybridMemoryRetriever(
         store,
-        KeywordSearchLane(store),
-        MetadataSearchLane(store),
-        SemanticSearchLane(store, _FailingEmbedder()),
+        fts_lane=FtsSearchLane(store),
+        pattern_lane=PatternSearchLane(store),
+        metadata_lane=MetadataSearchLane(store),
+        semantic_lane=SemanticSearchLane(store, _FailingEmbedder()),
     )
 
     async def scenario() -> None:
@@ -409,9 +534,9 @@ def test_v1_database_migrates_and_backfills_without_fact_changes(
     connection.commit()
     connection.close()
     store = SQLiteMemoryStore(database)
-    assert store.index_diagnostics()["schema_version"] == 3
+    assert store.index_diagnostics()["schema_version"] == 7
     version = store._connection.execute("PRAGMA user_version").fetchone()[0]  # noqa: SLF001
-    assert version == 3
+    assert version == 7
 
 
 def test_nested_memory_config_parsing(tmp_path: Path) -> None:

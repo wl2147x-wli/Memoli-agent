@@ -29,6 +29,14 @@ class RevisionConflictError(RuntimeError):
     """调用者基于过期 revision 更新状态。"""
 
 
+class WorkingStateReadError(RuntimeError):
+    """只读查询无法安全返回已提交 checkpoint。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class WorkingStateRepository:
     """按 session/task 保存最新版 checkpoint，并保留 revision 日志。"""
 
@@ -194,3 +202,38 @@ class WorkingStateRepository:
             values[name] = tuple(json.loads(values.pop(f"{name}_json")))
         values["stale"] = bool(values["stale"])
         return WorkingCheckpoint(**values)
+
+
+def read_checkpoint_readonly(
+    database: str | Path,
+    session_key: str,
+) -> WorkingCheckpoint | None:
+    """只读打开既有数据库；查询不得创建文件、目录或 schema。"""
+
+    path = Path(database)
+    if not path.is_file():
+        return None
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.2)
+        connection.row_factory = sqlite3.Row
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != _SCHEMA_VERSION:
+            raise WorkingStateReadError("unsupported-schema")
+        row = connection.execute(
+            "SELECT * FROM working_checkpoints WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        return WorkingStateRepository._from_row(row) if row is not None else None
+    except WorkingStateReadError:
+        raise
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        code = "busy" if "locked" in message or "busy" in message else "storage-error"
+        raise WorkingStateReadError(code) from None
+    except sqlite3.DatabaseError:
+        raise WorkingStateReadError("storage-error") from None
+    finally:
+        if connection is not None:
+            connection.close()

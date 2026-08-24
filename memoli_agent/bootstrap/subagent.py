@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
+from memoli_agent.agent.memory.governance import MemoryGovernanceService
 from memoli_agent.agent.plugins.hooks import HookBus
 from memoli_agent.agent.provider import ProviderLike
 from memoli_agent.agent.skills.runtime import SkillRuntime
@@ -34,6 +35,7 @@ def build_subagent_manager(
     trajectory_store: TrajectoryStore,
     hook_bus: HookBus | None = None,
     skill_runtime: SkillRuntime | None = None,
+    governance_service: MemoryGovernanceService | None = None,
 ) -> SubAgentManager | None:
     """按配置创建共享 provider、独立上下文和独立工具注册表的运行时。"""
 
@@ -57,6 +59,7 @@ def build_subagent_manager(
         source_registry=source_registry,
         workspace=Path(config.runtime.workspace),
         hook_bus=hook_bus,
+        governance_service=governance_service,
         code_timeout_seconds=config.tools.code_timeout_seconds,
         code_max_output_chars=config.tools.code_max_output_chars,
         file_read_max_lines=config.tools.file_read_max_lines,

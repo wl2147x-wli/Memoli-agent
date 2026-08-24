@@ -15,6 +15,7 @@ from memoli_agent.agent.working.models import (
     RuntimeStatus,
     WorkingCheckpoint,
     WorkingStateRenderResult,
+    WorkingStateSnapshot,
 )
 from memoli_agent.agent.working.repository import (
     RevisionConflictError,
@@ -123,7 +124,7 @@ class WorkingStateStore:
             f"elapsed_seconds: {hard.elapsed_seconds:.3f}",
             f"last_tool: {hard.last_tool}",
             f"last_tool_status: {hard.last_tool_status}",
-            "artifacts: " + (", ".join(hard.artifacts) or "unavailable"),
+            "runtime_artifacts: " + (", ".join(hard.artifacts) or "unavailable"),
             "</runtime_status>",
             '<working_checkpoint trust="agent">',
         ]
@@ -136,6 +137,9 @@ class WorkingStateStore:
                 ("next_action", checkpoint.next_action),
                 ("key_info", checkpoint.key_info),
                 ("related_sop", checkpoint.related_sop),
+                ("constraints", "; ".join(checkpoint.constraints)),
+                ("decisions", "; ".join(checkpoint.decisions)),
+                ("agent_artifacts", ", ".join(checkpoint.artifacts)),
             ):
                 lines.append(f"{label}: {value or 'unavailable'}")
             lines.append(f"status: {checkpoint.status}")
@@ -158,17 +162,17 @@ class WorkingStateStore:
     def get_checkpoint(self, session_key: str) -> WorkingCheckpoint | None:
         return self.repository.get(session_key)
 
-    def render_checkpoint(self, session_key: str) -> str:
-        """兼容旧接口；新 Agent Loop 使用 render_status。"""
+    def snapshot(self, session_key: str) -> WorkingStateSnapshot:
+        """返回只读快照；Agent 软状态不能覆盖 Runtime 验证的硬状态。"""
 
         checkpoint = self.repository.get(session_key)
-        if checkpoint is None:
-            return ""
-        parts = ["<working_checkpoint>", checkpoint.key_info]
-        if checkpoint.related_sop:
-            parts.append(f"相关 SOP：{checkpoint.related_sop}")
-        parts.append("</working_checkpoint>")
-        return "\n".join(parts)
+        runtime_status = self.runtime_statuses.get(session_key)
+        return WorkingStateSnapshot(
+            session_key=session_key,
+            availability="available" if checkpoint is not None else "not-found",
+            checkpoint=checkpoint,
+            runtime_status=runtime_status,
+        )
 
     def create_request(
         self, trace_id: str, session_key: str, tool_call_id: str
@@ -316,6 +320,7 @@ class AskUserTool:
 @dataclass(slots=True)
 class StartLongTermUpdateTool:
     state: WorkingStateStore
+    memory_runtime: Any = None
     name: str = "start_long_term_update"
     description: str = (
         "记录一个待处理的长期经验整理请求；当前调用不会自动更新记忆、"
@@ -333,6 +338,38 @@ class StartLongTermUpdateTool:
         context = current_tool_context()
         if context is None:
             return _error(self.name, "缺少工具执行上下文。")
+        if self.memory_runtime is not None:
+            hint = await self.memory_runtime.request_long_term_update(
+                trace_id=context.trace_id,
+                session_id=context.session_key,
+                idempotency_key=(
+                    context.tool_call_id
+                    or f"{context.trace_id}:{context.session_key}:long-term-update"
+                ),
+            )
+            status = str(hint.get("status") or "disabled")
+            scope = hint.get("scope")
+            raw = json.dumps(
+                {
+                    "hint_id": str(hint.get("hint_id") or ""),
+                    "trace_id": context.trace_id,
+                    "scope": {
+                        "kind": getattr(scope, "kind", "user"),
+                        "identifier": getattr(scope, "identifier", "default"),
+                    },
+                    "status": status,
+                    "pending_chat_count": int(hint.get("pending_chat_count") or 0),
+                    "reason": str(hint.get("reason") or ""),
+                },
+                ensure_ascii=False,
+            )
+            return ToolResult(
+                raw,
+                raw_content=raw,
+                status=status,
+                success=status != "disabled",
+                metadata={"tool": self.name, "hint_id": hint.get("hint_id", "")},
+            )
         request = self.state.create_request(
             context.trace_id, context.session_key, context.tool_call_id
         )

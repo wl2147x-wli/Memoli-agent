@@ -16,6 +16,7 @@ from memoli_agent.agent.plugins.hooks import HookBus, HookRegistration
 from memoli_agent.agent.tools.base import ToolResult
 from memoli_agent.agent.tools.execution import ToolExecutionContext
 from memoli_agent.agent.tools.registry import ToolRegistry
+from memoli_agent.agent.trajectory import SQLiteTrajectoryStore
 from memoli_agent.bootstrap.app import build_app_runtime
 from memoli_agent.bootstrap.config import (
     AppConfig,
@@ -112,6 +113,52 @@ def test_policy_exception_denies_tool_and_tool_after_observes_rejection() -> Non
     assert result.success is False
     assert result.effective_status == "denied"
     assert observed[0].status == "denied"
+
+
+def test_shared_tool_hook_reproduces_unknown_governor_trace_fk_failure(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[bool, str, bool]:
+        trajectory = SQLiteTrajectoryStore(
+            tmp_path / "trajectory.db", payload_directory=tmp_path / "payloads"
+        )
+        await trajectory.start()
+        try:
+            bus = HookBus(trajectory)
+            bus.register(
+                _hook(
+                    "shell_safety",
+                    HookName.TOOL_BEFORE,
+                    HookKind.POLICY,
+                    lambda event: ToolDecision.allow(),
+                )
+            )
+            shared = ToolRegistry(hook_bus=bus)
+            shared.register(CaptureTool(parameters={"type": "object"}))
+            failed = await shared.execute(
+                "capture",
+                {"value": "governor"},
+                context=ToolExecutionContext(
+                    "f" * 32, "subagent:memory-governor", "call-governor"
+                ),
+            )
+            isolated = ToolRegistry(hook_bus=None)
+            isolated.register(CaptureTool(parameters={"type": "object"}))
+            succeeded = await isolated.execute(
+                "capture",
+                {"value": "governor"},
+                context=ToolExecutionContext(
+                    "f" * 32, "subagent:memory-governor", "call-isolated"
+                ),
+            )
+            return failed.success, failed.content, succeeded.success
+        finally:
+            await trajectory.close()
+
+    shared_success, error, isolated_success = asyncio.run(scenario())
+    assert not shared_success
+    assert "IntegrityError" in error
+    assert isolated_success
 
 
 def test_default_plugins_write_lifecycle_and_model_hooks_to_same_sqlite(

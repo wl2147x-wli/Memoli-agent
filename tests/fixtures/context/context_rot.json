@@ -1,0 +1,10 @@
+{
+  "turns": [
+    {"role": "user", "content": "目标：发布报告；约束：不得删除原始证据。"},
+    {"role": "assistant", "content": "决定先读取数据，因为需要验证来源。"},
+    {"role": "tool", "content": "evidence.csv sha256=abc123；验证状态：读取成功。"},
+    {"role": "assistant", "content": "失败路径：首次格式转换失败，保留原文件。"},
+    {"role": "user", "content": "TODO：修复格式，运行测试，然后交付 report.md。"},
+    {"role": "assistant", "content": "remaining work：生成报告并确认测试通过。"}
+  ]
+}

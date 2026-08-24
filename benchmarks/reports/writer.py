@@ -82,6 +82,29 @@ class ReportWriter:
                 "",
             ]
 
+        layered = metrics.get("layered_memory")
+        if isinstance(layered, dict) and any(
+            layered.get(key) is not None
+            for key in (
+                "adherence_rate",
+                "candidate_validity_rate",
+                "activation_rate",
+                "held_out_gain",
+            )
+        ):
+            lines += [
+                "## 记忆学习分层评估",
+                "",
+                "- 与官方分数分开呈现，区分更新器能力与受益能力。",
+                f"- adherence_rate: `{layered.get('adherence_rate')}`"
+                "（合同拒绝计为遵循失败而非规则错误）",
+                f"- candidate_validity_rate: "
+                f"`{layered.get('candidate_validity_rate')}`",
+                f"- activation_rate: `{layered.get('activation_rate')}`",
+                f"- held_out_gain: `{layered.get('held_out_gain')}`",
+                "",
+            ]
+
         lines += [
             "## 输出文件",
             "",
@@ -258,7 +281,9 @@ HTTP / CLI adapter 期望 Agent 返回 JSON object：
 ## metrics.json
 
 包含 `dataset`、`split`、`metric_source`、`total_samples`、
-`total_questions`、`overall`、`by_question_type` 和 `config`。
+`total_questions`、`overall`、`by_question_type`、`config` 和可选的
+`layered_memory`（adherence_rate/candidate_validity_rate/activation_rate/held_out_gain，
+未启用或无证据时为 `null`）。
 
 ## LoCoMo official qa 重组格式
 

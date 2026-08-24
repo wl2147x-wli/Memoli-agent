@@ -136,16 +136,18 @@ sequenceDiagram
     Pipe->>Pipe: BeforeTurn：获取 Session，创建 TurnState
     Pipe->>Pipe: BeforeReasoning：预留扩展点
     Pipe->>Ctx: PromptRender：渲染 messages
-    Ctx-->>Pipe: 返回 system + history + current user messages
+    Ctx-->>Pipe: 返回稳定 system/skill + memory + history + current user
     Pipe->>Reasoner: ReasonerPhase：generate(messages)
 
+    Reasoner->>Reasoner: 调用前去重并追加唯一最新 agent_status
     Reasoner->>Provider: chat(messages, tools)
     Provider-->>Reasoner: 返回 LLMResponse
 
     alt 模型返回 tool_calls
         Reasoner->>Tools: execute(name, arguments)
         Tools-->>Reasoner: 返回 ToolResult
-        Reasoner->>Provider: chat(messages + tool result, tools)
+        Reasoner->>Reasoner: 按最新 revision 重建唯一 agent_status
+        Reasoner->>Provider: chat(messages + tool result + agent_status, tools)
         Provider-->>Reasoner: 返回最终 LLMResponse
     else 模型没有返回 tool_calls
         Reasoner-->>Pipe: 直接使用第一次模型回复
@@ -180,9 +182,9 @@ sequenceDiagram
 | Phase 协议 | `agent/lifecycle/phase.py` | 定义 phase module 的执行接口。 |
 | 默认阶段 | `agent/lifecycle/phases.py` | 实现 BeforeTurn、PromptRender、Reasoner、AfterTurn 等默认阶段。 |
 | 会话管理 | `agent/session.py` | 按 `session_key` 保存多轮会话历史。 |
-| 上下文构建 | `agent/context.py` | 把 system prompt、历史消息和当前用户消息组装成 messages。 |
+| 上下文构建 | `agent/context.py` | 把 system/Skill、Memory、历史消息和当前用户消息组装成初始 messages；不预置 Working State。 |
 | Prompt block | `agent/core/prompt_blocks.py` | 构建基础 system prompt。 |
-| 推理器 | `agent/core/reasoner.py` | 在预算内调用模型并串行执行多轮 tool call。 |
+| 推理器 | `agent/core/reasoner.py` | 在每次 Provider 调用前注入唯一最新 `<agent_status>`，并在预算内串行执行多轮 tool call。 |
 | 模型接口 | `agent/provider.py` | 定义 EchoProvider 和 OpenAI-compatible provider。 |
 | 工具协议 | `agent/tools/base.py` | 定义工具接口、工具结果和工具错误。 |
 | 工具注册表 | `agent/tools/registry.py` | 注册工具、导出 schema、执行工具。 |

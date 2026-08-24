@@ -146,9 +146,7 @@ class SQLiteSkillRepository:
                 actor,
                 reason,
             )
-            result = self.get_version(
-                package.manifest.name, package.manifest.version
-            )
+            result = self.get_version(package.manifest.name, package.manifest.version)
             assert result is not None
             return result
 

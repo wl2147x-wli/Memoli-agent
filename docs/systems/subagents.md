@@ -47,6 +47,11 @@ workspace/subagents/<task_id>/
 - `research`：工作区只读、显式授权的记忆召回、已启用的网页读取；没有写工具或继续委派工具。
 - `coding`：工作区只读，写入和代码执行根目录绑定到任务目录，代码执行默认拒绝常见网络访问。
 - `general`：显式选择的受限能力合集，仍不暴露长期记忆写入、主 working checkpoint 或继续委派。
+- `memory-governor`：只注册绑定当前 Job 的
+  `governance_candidate_read / governance_evidence_read /
+  governance_related_claims / governance_decide`。它使用 `NullTrajectoryStore`，Reasoner
+  与 ToolRegistry 均不继承共享 HookBus；决定只经 Policy Gate 写 `memory.db`，task ID
+  与状态留在 task graph，不写主 `trajectories.db`。
 
 每个任务创建全新的 ToolRegistry，未授权工具不会进入模型 schema。Hook 仍位于工具执行边界。这里的“禁网”是本阶段的进程内策略防线，不等同于操作系统或容器级网络隔离。
 

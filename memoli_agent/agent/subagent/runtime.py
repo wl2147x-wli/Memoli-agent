@@ -19,6 +19,7 @@ from memoli_agent.agent.subagent.profiles import (
 from memoli_agent.agent.tools.control import WorkingStateStore
 from memoli_agent.agent.trajectory import (
     NewTrajectoryEvent,
+    NullTrajectoryStore,
     SpanKind,
     SpanProjection,
     TraceProjection,
@@ -45,7 +46,25 @@ class SubAgentRuntimeFactory:
     skill_runtime: SkillRuntime | None = None
     stream_model: bool = False
 
-    def build(self, profile: SubAgentProfile, task: SubAgentTask) -> Reasoner:
+    def trajectory_store_for(self, profile: SubAgentProfile) -> TrajectoryStore:
+        """Keep internal memory governance out of the user interaction ledger."""
+        if profile.name == "memory-governor":
+            return NullTrajectoryStore()
+        return self.trajectory_store
+
+    def hook_bus_for(self, profile: SubAgentProfile) -> HookBus | None:
+        """Keep internal governance out of shared plugin persistence and hooks."""
+        if profile.name == "memory-governor":
+            return None
+        return self.hook_bus
+
+    def build(
+        self,
+        profile: SubAgentProfile,
+        task: SubAgentTask,
+        *,
+        trajectory_store: TrajectoryStore | None = None,
+    ) -> Reasoner:
         iteration_override = task.metadata.get("max_iterations")
         elapsed_override = task.metadata.get("max_elapsed_seconds")
         profile = replace(
@@ -64,19 +83,28 @@ class SubAgentRuntimeFactory:
         memory_refs = (
             task.context_package.memory_refs if task.context_package is not None else ()
         )
-        registry = self.tool_registry_factory.build(profile, task.task_dir, memory_refs)
+        selected_hook_bus = self.hook_bus_for(profile)
+        registry = self.tool_registry_factory.build(
+            profile,
+            task.task_dir,
+            memory_refs,
+            inherit_hook_bus=selected_hook_bus is not None,
+        )
+        selected_trajectory_store = trajectory_store or self.trajectory_store_for(
+            profile
+        )
         return Reasoner(
             provider=self.provider,
             fallback_provider=self.fallback_provider,
             tool_registry=registry,
-            trajectory_store=self.trajectory_store,
+            trajectory_store=selected_trajectory_store,
             max_iterations=profile.max_iterations,
             max_elapsed_seconds=profile.max_elapsed_seconds,
             no_progress_limit=self.no_progress_limit,
             model_name=self.model_name,
             # 独立内存 repository，避免 begin_turn 把主会话 checkpoint 标为 stale。
             working_state=WorkingStateStore(),
-            hook_bus=self.hook_bus,
+            hook_bus=selected_hook_bus,
             stream_model=self.stream_model,
         )
 
@@ -97,7 +125,12 @@ class SubAgentRuntime:
                 "UnknownProfile",
             )
 
-        reasoner = self.factory.build(profile, task)
+        trajectory_store = self.factory.trajectory_store_for(profile)
+        reasoner = self.factory.build(
+            profile,
+            task,
+            trajectory_store=trajectory_store,
+        )
         context = task.context_package or ContextPackage(objective=task.instruction)
         trace_id = task.trace_id or new_trace_id()
         root_span_id = new_span_id()
@@ -130,7 +163,7 @@ class SubAgentRuntime:
             },
         )
         try:
-            await self.factory.trajectory_store.record(
+            await trajectory_store.record(
                 NewTrajectoryEvent(
                     trace_id=trace_id,
                     span_id=root_span_id,

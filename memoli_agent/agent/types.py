@@ -48,14 +48,18 @@ class TurnState:
 
 @dataclass(frozen=True, slots=True)
 class ContextRequest:
-    """上下文构建请求。"""
+    """上下文构建请求。
+
+    ``recent_turns`` 由 ``CrossTurnContextPhase`` 从 canonical committed turn
+    重构得到（§3.1）；Session 不再提供消息历史副本，编译器只消费该结构化来源。
+    """
 
     turn_state: TurnState
     agent_name: str
     system_prompt: str
     skill_catalog_prompt_block: str = ""
     memory_prompt_block: str = ""
-    working_prompt_block: str = ""
+    recent_turns: tuple[ChatMessage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

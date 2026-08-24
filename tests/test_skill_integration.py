@@ -103,7 +103,7 @@ def test_enabled_runtime_registers_tenth_tool_and_orders_catalog_before_memory(
         assert len(registry.list_tools()) == 10
         assert registry.list_tools()[-1].name == "skill_load"
 
-        session = Session(session_key="cli:1", history_window=20)
+        session = Session(session_key="cli:1")
         catalog = components.runtime.build_catalog(
             session_instance_id=session.session_instance_id,
             session_key=session.session_key,
@@ -120,22 +120,20 @@ def test_enabled_runtime_registers_tenth_tool_and_orders_catalog_before_memory(
                 system_prompt="base-system",
                 skill_catalog_prompt_block=catalog.content,
                 memory_prompt_block="memory-block",
-                working_prompt_block="working-block",
             )
         )
-        assert [message.content for message in rendered.messages[:4]] == [
+        assert [message.content for message in rendered.messages[:3]] == [
             "base-system",
             catalog.content,
             "memory-block",
-            "working-block",
         ]
     finally:
         components.close()
 
 
 def test_process_restart_creates_new_session_instance() -> None:
-    first = SessionManager(20).get_or_create("cli:same")
-    second = SessionManager(20).get_or_create("cli:same")
+    first = SessionManager().get_or_create("cli:same")
+    second = SessionManager().get_or_create("cli:same")
     assert first.session_key == second.session_key
     assert first.session_instance_id != second.session_instance_id
 

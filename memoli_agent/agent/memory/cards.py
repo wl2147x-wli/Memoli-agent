@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from memoli_agent.agent.memory.models import (
@@ -35,8 +36,7 @@ class DeterministicCardTextGenerator:
     ) -> CardDraft:
         title = "个人记忆" if key.subject == "general" else key.subject
         statements = tuple(
-            CardDraftStatement(content, (claim_id,))
-            for claim_id, content in claims
+            CardDraftStatement(content, (claim_id,)) for claim_id, content in claims
         )
         return CardDraft(key, title, statements)
 
@@ -54,10 +54,13 @@ class CardBuilder:
     store: SQLiteMemoryStore
     generator: CardTextGenerator = DeterministicCardTextGenerator()
     batch_size: int = 4
+    worker_id: str = field(default_factory=lambda: f"card-builder-{uuid.uuid4().hex}")
 
     def tick(self) -> tuple[CardBuildResult, ...]:
         results: list[CardBuildResult] = []
-        for job in self.store.claim_projection_jobs("card", self.batch_size):
+        for job in self.store.claim_projection_jobs(
+            "card", self.batch_size, worker_id=self.worker_id
+        ):
             projection_key = str(job["projection_key"])
             try:
                 payload = json.loads(str(job["payload_json"]))
@@ -71,16 +74,22 @@ class CardBuilder:
                     "card",
                     projection_key,
                     "skipped" if result.status in {"empty", "frozen"} else "ready",
+                    worker_id=self.worker_id,
                 )
                 results.append(result)
             except Exception as exc:
                 self.store.fail_projection_job(
-                    "card", projection_key, type(exc).__name__
+                    "card",
+                    projection_key,
+                    type(exc).__name__,
+                    worker_id=self.worker_id,
                 )
                 results.append(CardBuildResult(projection_key, "failed"))
         return tuple(results)
 
     def build(self, key: CardProjectionKey) -> CardBuildResult:
+        if self.store.has_unresolved_card_conflict(key):
+            raise CardGenerationError("unresolved-card-conflict")
         rows = self.store.eligible_card_claims(key)
         claims = tuple((str(row["claim_id"]), str(row["content"])) for row in rows)
         if not claims:
@@ -101,6 +110,7 @@ class CardBuilder:
             title=draft.title,
             content=draft.content,
             claim_ids=claim_ids,
+            statements=draft.statements,
         )
         return CardBuildResult(
             key.value,

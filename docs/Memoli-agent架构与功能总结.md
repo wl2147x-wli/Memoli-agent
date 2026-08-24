@@ -341,7 +341,8 @@ OpenTelemetry 兼容的 trace/span/event 系统：
 两层状态管理：
 - **软状态**（Agent 维护）：`WorkingCheckpoint` — objective, current_step, next_action, key_info, related_sop, constraints, decisions, artifacts
 - **硬状态**（运行时投影）：`RuntimeStatus` — iteration, elapsed, last_tool, artifacts
-- 渲染为 `<agent_status>` XML 块注入模型上下文
+- Reasoner 在每次 Provider 调用前去重并渲染唯一最新 `<agent_status>`；PromptRenderPhase 不预置遗留块
+- `<agent_status>` 明确分区 Runtime 硬状态/产物与 Agent 软 checkpoint/产物
 - **乐观并发**：基于 revision 的冲突检测
 
 ### 4.6 子Agent 任务 DAG
@@ -440,7 +441,7 @@ SQLite 持久化任务编排：
 | `[trajectory]` | enabled, database, capture_content, payload 限制 |
 | `[memory]` | enabled, engine, auto_recall, card/recall 限制, consolidation, legacy_import |
 | `[memory.embedding]` | disabled by default, openai-compatible provider |
-| `[memory.hybrid]` | rrf_k, keyword_weight, semantic_weight, metadata_weight |
+| `[memory.hybrid]` | rrf_k, rrf_bonus_weight, fts/pattern/semantic/metadata 权重, 相对阈值, MMR |
 | `[working_memory]` | enabled, database, max_chars, stale_policy |
 | `[tools]` | tool_search, code timeout/output, file limits, browser/subagent/memory_manage 开关 |
 | `[plugins]` | enabled list, sandbox config, hook_deadline_seconds, trusted/force_sandbox |

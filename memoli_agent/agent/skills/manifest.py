@@ -145,9 +145,7 @@ def _split_frontmatter(content: str) -> tuple[dict[str, Any], str]:
         raise SkillValidationError("SKILL.md 必须以 YAML frontmatter 开始。")
     try:
         end = next(
-            index
-            for index in range(1, len(lines))
-            if lines[index].strip() == "---"
+            index for index in range(1, len(lines)) if lines[index].strip() == "---"
         )
     except StopIteration as exc:
         raise SkillValidationError("SKILL.md 缺少 frontmatter 结束标记。") from exc

@@ -7,8 +7,11 @@ Markdown 长期记忆系统。
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import operator
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -157,6 +160,56 @@ class MemoryRecallTool:
                 "scope_id": {"type": "string"},
                 "statuses": {"type": "array", "items": {"type": "string"}},
                 "max_sensitivity": {"type": "string"},
+                "fact_type": {
+                    "type": "string",
+                    "enum": [
+                        "preference",
+                        "profile",
+                        "project",
+                        "goal",
+                        "health",
+                        "credential",
+                        "relationship",
+                    ],
+                },
+                "subject": {"type": "string"},
+                "entity": {"type": "string"},
+                "predicate": {"type": "string"},
+                "value": {},
+                "sensitivity": {
+                    "type": "string",
+                    "enum": ["public", "private", "sensitive"],
+                },
+                "retrieval_mode": {
+                    "type": "string",
+                    "enum": [
+                        "auto",
+                        "card-first",
+                        "claim-first",
+                        "episode-first",
+                        "hybrid",
+                    ],
+                },
+                "detail_level": {
+                    "type": "string",
+                    "enum": ["summary", "fact", "evidence"],
+                },
+                "statement_ids": {"type": "array", "items": {"type": "string"}},
+                "card_statement_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+                "claim_expansion_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                },
+                "evidence_expansion_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                },
                 "at_time": {
                     "type": "string",
                     "description": "可选 ISO-8601 时间，用于时态检索。",
@@ -199,12 +252,24 @@ class MemoryRecallTool:
                         str(arguments.get("scope_kind") or "user"),
                         str(arguments.get("scope_id") or "default"),
                     ),
-                    statuses=tuple(arguments.get("statuses") or ("active", "frozen")),
+                    statuses=tuple(
+                        arguments.get("statuses") or ("active", "approved", "frozen")
+                    ),
                     max_sensitivity=str(arguments.get("max_sensitivity") or "private"),
                     at_time=(
                         datetime.fromisoformat(str(arguments["at_time"]))
                         if arguments.get("at_time")
                         else None
+                    ),
+                    retrieval_mode=str(arguments.get("retrieval_mode") or "auto"),  # type: ignore[arg-type]
+                    detail_level=str(arguments.get("detail_level") or "summary"),  # type: ignore[arg-type]
+                    statement_ids=tuple(arguments.get("statement_ids") or ()),
+                    card_statement_limit=int(arguments.get("card_statement_limit", 6)),
+                    claim_expansion_limit=int(
+                        arguments.get("claim_expansion_limit", 6)
+                    ),
+                    evidence_expansion_limit=int(
+                        arguments.get("evidence_expansion_limit", 3)
                     ),
                 )
             )
@@ -234,6 +299,9 @@ class MemoryRecallTool:
                 "evidence": [
                     {"kind": ref.kind, "ref_id": ref.ref_id} for ref in item.evidence
                 ],
+                "card_id": item.metadata.get("card_id"),
+                "version_id": item.metadata.get("version_id"),
+                "claim_ids": item.metadata.get("claim_ids", ()),
             }
             for item in result.items
         ]
@@ -244,6 +312,10 @@ class MemoryRecallTool:
                 "candidate_count": result.candidate_count,
                 "filtered_count": result.filtered_count,
                 "reason": result.reason,
+                "requested_route": result.requested_route,
+                "actual_route": result.actual_route,
+                "detail_level": result.detail_level,
+                "degraded_reasons": result.degraded_reasons,
             },
             ensure_ascii=False,
         )
@@ -264,7 +336,13 @@ class MemoryManageTool:
 
     memory_runtime: MemoryRuntime | None
     name: str = "memory_manage"
-    description: str = "记住、纠正、冻结、删除、列出或导出个人记忆。"
+    description: str = (
+        "个人记忆治理入口。remember/correct 是在线证据层：content 必须与当前用户"
+        "消息中逐字 basis_quote 一致（可去“请记住/记住/remember”指令包装），禁止改写"
+        "人称、加注或润色；归纳、抽象、消歧与冲突合并属离线整理层，不由本工具完成。"
+        "单条显式用户陈述即可作为证据写入，是否沉淀为稳定语义记忆由离线整理层决定。"
+        "另支持冻结、删除、列出、导出、候选治理与离线整理请求操作。"
+    )
     parameters: dict[str, Any] = field(
         default_factory=lambda: {
             "type": "object",
@@ -277,16 +355,33 @@ class MemoryManageTool:
                         "freeze",
                         "forget",
                         "list",
+                        "show",
+                        "approve",
+                        "reject",
+                        "review",
+                        "request_list",
+                        "request_status",
+                        "request_retry",
+                        "request_cancel",
+                        "governance_retry",
                         "export",
                     ],
                 },
                 "content": {"type": "string"},
                 "basis_quote": {
                     "type": "string",
-                    "description": "remember/correct 时必须逐字来自当前用户消息。",
+                    "description": (
+                        "remember/correct 时的逐字依据：必须逐字复制当前用户消息中的"
+                        "原话（可含“请记住/记住/remember”前缀），不得改写人称或加注；"
+                        "系统据此确定性去除指令包装得到权威正文，content 须与之一致。"
+                    ),
                 },
-                "entity_type": {"type": "string", "enum": ["claim", "card"]},
+                "entity_type": {
+                    "type": "string",
+                    "enum": ["claim", "card", "candidate"],
+                },
                 "entity_id": {"type": "string"},
+                "expected_revision": {"type": "integer", "minimum": 0},
                 "scope_kind": {"type": "string"},
                 "scope_id": {"type": "string"},
                 "max_sensitivity": {"type": "string"},
@@ -311,6 +406,121 @@ class MemoryManageTool:
             str(arguments.get("scope_id") or "default"),
         )
         context = current_tool_context()
+        governance = self.memory_runtime.governance_service
+        if not _memory_scope_authorized(scope, context):
+            return ToolResult(
+                "记忆操作被拒绝：scope 不属于当前用户或会话。",
+                success=False,
+                status="denied",
+                metadata={"tool": self.name, "error": "scope-forbidden"},
+            )
+        if action == "list" and str(arguments.get("entity_type") or "") == "candidate":
+            return _json_tool_result(
+                self.name,
+                {"status": "success", "candidates": governance.list_candidates(scope)},
+            )
+        if action == "show":
+            candidate_id = str(arguments.get("entity_id") or "")
+            try:
+                detail = governance.show_candidate(candidate_id, scope)
+            except (KeyError, PermissionError):
+                return ToolResult("candidate-not-found-or-forbidden", success=False)
+            return _json_tool_result(self.name, {"status": "success", **detail})
+        if action in {"approve", "reject", "review"}:
+            candidate_id = str(arguments.get("entity_id") or "")
+            basis = str(arguments.get("basis_quote") or "").strip()
+            if context is None or not basis or basis not in context.user_content:
+                return ToolResult(
+                    "Candidate decision requires an explicit current-user instruction.",
+                    success=False,
+                    status="denied",
+                )
+            try:
+                audit = governance.decide_user(
+                    candidate_id,
+                    scope,
+                    decision_kind=(
+                        "needs-user-review" if action == "review" else action
+                    ),
+                    expected_revision=int(arguments.get("expected_revision", -1)),
+                    actor=f"user:{context.user_message_id}",
+                )
+            except (KeyError, PermissionError, ValueError):
+                return ToolResult("candidate-decision-failed", success=False)
+            return _json_tool_result(
+                self.name,
+                {
+                    "status": audit.outcome,
+                    "decision_id": audit.decision_id,
+                    "candidate_id": audit.candidate_id,
+                    "actual_revision": audit.actual_revision,
+                },
+            )
+        if action.startswith("request_"):
+            request_id = str(arguments.get("entity_id") or "")
+            if action == "request_list":
+                requests = store.list_long_term_update_requests(scope)
+                return _json_tool_result(
+                    self.name,
+                    {
+                        "status": "success",
+                        "requests": [
+                            {
+                                "request_id": item.request_id,
+                                "state": item.state,
+                                "attempts": item.attempts,
+                                "last_error_type": item.last_error_type,
+                            }
+                            for item in requests
+                        ],
+                        "diagnostics": store.offline_diagnostics(),
+                    },
+                )
+            if action == "request_status":
+                request = store.get_long_term_update_request(request_id, scope)
+                return _json_tool_result(
+                    self.name,
+                    {
+                        "status": request.state if request else "not-found",
+                        "request_id": request_id,
+                        "attempts": request.attempts if request else 0,
+                        "last_error_type": (request.last_error_type if request else ""),
+                    },
+                )
+            basis = str(arguments.get("basis_quote") or "").strip()
+            if context is None or not basis or basis not in context.user_content:
+                return ToolResult(
+                    "Request recovery requires an explicit current-user instruction.",
+                    success=False,
+                    status="denied",
+                )
+            changed = (
+                store.retry_long_term_update_request(request_id, scope)
+                if action == "request_retry"
+                else store.cancel_long_term_update_request(request_id, scope)
+            )
+            if changed and self.memory_runtime.offline_worker is not None:
+                self.memory_runtime.offline_worker.wake()
+            return _json_tool_result(
+                self.name,
+                {
+                    "status": "success" if changed else "not-changed",
+                    "request_id": request_id,
+                },
+            )
+        if action == "governance_retry":
+            job_id = str(arguments.get("entity_id") or "")
+            basis = str(arguments.get("basis_quote") or "").strip()
+            if context is None or not basis or basis not in context.user_content:
+                return ToolResult(
+                    "Governance retry requires an explicit current-user instruction.",
+                    success=False,
+                    status="denied",
+                )
+            result = governance.retry_job(job_id, scope)
+            if result.get("status") == "retry" and self.memory_runtime.offline_worker:
+                self.memory_runtime.offline_worker.wake()
+            return _json_tool_result(self.name, result)
         if action in {"remember", "correct"}:
             content = str(arguments.get("content") or "").strip()
             basis = str(arguments.get("basis_quote") or "").strip()
@@ -321,32 +531,101 @@ class MemoryManageTool:
                 or basis not in context.user_content
             ):
                 return ToolResult(
-                    "正式记忆写入被拒绝：缺少当前用户消息中的显式依据。",
+                    "正式记忆写入被拒绝：缺少当前用户消息中的逐字依据。"
+                    "请从当前用户消息中逐字引用原话作为 basis_quote，不得改写。",
                     success=False,
                     status="rejected",
                     metadata={"tool": self.name, "error": "missing-explicit-basis"},
                 )
-            item = await self.memory_runtime.mutate(
-                MemoryMutation(
-                    content=content,
-                    source="memory-manage",
-                    scope=scope,
-                    evidence=(EvidenceRef("message", context.user_message_id, basis),),
-                    metadata={"message_id": context.user_message_id},
+            authoritative = _normalize_explicit_basis(basis)
+            if not authoritative or not _same_fact(content, authoritative):
+                return ToolResult(
+                    "正式记忆写入被拒绝：content 与当前用户逐字依据不一致。"
+                    "content 必须逐字复制当前用户原话（仅可去“请记住”指令包装），"
+                    "不得改写人称、加注或润色；归纳与改写属离线整理层。",
+                    success=False,
+                    status="rejected",
+                    metadata={"tool": self.name, "error": "basis-content-mismatch"},
                 )
+            fact_type = str(arguments.get("fact_type") or "profile")
+            try:
+                sensitivity = _sensitivity_floor(
+                    authoritative,
+                    fact_type,
+                    str(arguments.get("sensitivity") or "private"),
+                )
+            except ValueError as exc:
+                return ToolResult(
+                    f"正式记忆写入被拒绝：{exc}",
+                    success=False,
+                    status="rejected",
+                    metadata={"tool": self.name, "error": "invalid-fact-metadata"},
+                )
+            start = context.user_content.find(basis)
+            evidence = EvidenceRef(
+                "message",
+                context.user_message_id,
+                basis,
+                {
+                    "verified": True,
+                    "trace_id": context.trace_id,
+                    "role": "user",
+                    "content_hash": hashlib.sha256(
+                        context.user_content.encode()
+                    ).hexdigest(),
+                    "locator": {"start": start, "end": start + len(basis)},
+                    "user_message_id": context.user_message_id,
+                },
             )
-            if action == "correct" and arguments.get("entity_id"):
-                old_id = str(arguments["entity_id"])
-                store.set_status(
-                    str(arguments.get("entity_type") or "claim"),
-                    old_id,
-                    "superseded",
-                    context.user_message_id,
+            mutation = MemoryMutation(
+                content=authoritative,
+                source="memory-manage",
+                scope=scope,
+                sensitivity=sensitivity,
+                explicitness="explicit-user",
+                evidence=(evidence,),
+                subject=str(arguments.get("subject") or "general"),
+                metadata={
+                    "message_id": context.user_message_id,
+                    "fact_type": fact_type,
+                    "entity": str(arguments.get("entity") or ""),
+                    "predicate": str(arguments.get("predicate") or ""),
+                    "value": arguments.get("value"),
+                    "verification_status": "verified",
+                    "prompt_allowed": sensitivity != "sensitive",
+                    "embedding_allowed": sensitivity != "sensitive",
+                },
+            )
+            try:
+                if action == "correct":
+                    old_id = str(arguments.get("entity_id") or "")
+                    if not old_id or "expected_revision" not in arguments:
+                        raise ValueError("correction-requires-target-and-revision")
+                    item = store.correct_claim(
+                        old_id,
+                        int(arguments["expected_revision"]),
+                        mutation,
+                        actor=f"user:{context.user_message_id}",
+                    )
+                else:
+                    item = await self.memory_runtime.mutate(mutation)
+            except (KeyError, PermissionError, RuntimeError, ValueError) as exc:
+                return ToolResult(
+                    f"正式记忆写入被拒绝：{exc}",
+                    success=False,
+                    status="rejected",
+                    metadata={"tool": self.name, "error": type(exc).__name__},
                 )
-                if str(arguments.get("entity_type") or "claim") == "claim":
-                    store.link_claims(item.item_id, old_id, "corrects")
             return _json_tool_result(
-                self.name, {"status": "success", "id": item.item_id}
+                self.name,
+                {
+                    "status": "success",
+                    "id": item.item_id,
+                    "claim_id": item.item_id,
+                    "action": action,
+                    "current_user_message_id": context.user_message_id,
+                    "basis_quote": basis,
+                },
             )
         if action in {"freeze", "forget"}:
             entity_id = str(arguments.get("entity_id") or "")
@@ -372,6 +651,56 @@ class MemoryManageTool:
             )
             return _json_tool_result(self.name, {"status": "success", "items": items})
         return ToolResult("不支持的 action。", success=False)
+
+
+_REMEMBER_WRAPPER = re.compile(
+    r"^\s*(?:请记住|记住|remember)\s*(?:[:：]\s*|\s+)", re.IGNORECASE
+)
+_SENSITIVE_FACT_PATTERN = re.compile(
+    r"(?i)(password|passcode|api[_ -]?key|token|credential|密码|口令|密钥|"
+    r"过敏|诊断|病史|疾病|用药|医疗)"
+)
+
+
+def _normalize_explicit_basis(basis: str) -> str:
+    if "\n" in basis or "\r" in basis:
+        return ""
+    return _REMEMBER_WRAPPER.sub("", basis, count=1).strip()
+
+
+def _same_fact(model_content: str, authoritative: str) -> bool:
+    def normalized(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).strip().split())
+
+    return bool(authoritative) and normalized(model_content) == normalized(
+        authoritative
+    )
+
+
+def _sensitivity_floor(content: str, fact_type: str, requested: str) -> str:
+    if fact_type not in {
+        "preference",
+        "profile",
+        "project",
+        "goal",
+        "health",
+        "credential",
+        "relationship",
+    }:
+        raise ValueError("invalid-fact-type")
+    if requested not in {"public", "private", "sensitive"}:
+        raise ValueError("invalid-sensitivity")
+    if fact_type in {"health", "credential"} or _SENSITIVE_FACT_PATTERN.search(content):
+        return "sensitive"
+    return requested
+
+
+def _memory_scope_authorized(scope: MemoryScope, context: Any) -> bool:
+    if scope.kind == "user":
+        return scope.identifier == "default"
+    if scope.kind == "session":
+        return context is not None and scope.identifier == context.session_key
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,9 +871,9 @@ class SpawnSubAgentTool:
         if not instruction:
             return ToolResult("缺少 instruction 参数。", success=False)
         context = current_tool_context()
-        session_key = (
-            context.session_key if context is not None else ""
-        ) or str(arguments.get("parent_session_key") or "").strip()
+        session_key = (context.session_key if context is not None else "") or str(
+            arguments.get("parent_session_key") or ""
+        ).strip()
         options: dict[str, Any] = {
             key: tuple(
                 str(item) for item in arguments.get(key, []) if str(item).strip()

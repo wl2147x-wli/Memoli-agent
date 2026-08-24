@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+WORKING_PRESENTATION_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeStatus:
@@ -63,3 +65,16 @@ class WorkingStateRenderResult:
     revision: int
     truncated: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingStateSnapshot:
+    """供本地表现层读取的结构化工作状态，不复用模型注入文本。"""
+
+    session_key: str
+    availability: str
+    checkpoint: WorkingCheckpoint | None = None
+    runtime_status: RuntimeStatus | None = None
+    schema_version: int = WORKING_PRESENTATION_SCHEMA_VERSION
+    truncated: bool = False
+    omitted_fields: tuple[str, ...] = ()

@@ -15,6 +15,10 @@ from benchmarks.datasets.base import BenchmarkPrediction, BenchmarkQuestion
 from benchmarks.datasets.locomo import LocomoDatasetAdapter
 from benchmarks.datasets.longmemeval import LongMemEvalDatasetAdapter
 from benchmarks.metrics.common import aggregate
+from benchmarks.metrics.layered_memory import (
+    collect_layered_memory,
+    compute_layered_memory,
+)
 from benchmarks.metrics.locomo import (
     DEFAULT_LOCOMO_EVAL_SCRIPT,
     evaluate_locomo_official,
@@ -70,6 +74,7 @@ async def run_benchmark(config) -> Path:
         **aggregate(records),
         "config": asdict(config),
     }
+    metrics["layered_memory"] = _collect_layered(config, agent, records)
 
     if config.output.save_predictions:
         writer.write_predictions(records)
@@ -126,6 +131,18 @@ def _has_provider_warning(record: dict[str, Any]) -> bool:
     metadata = record.get("metadata", {})
     provider = str(metadata.get("provider", "")).lower()
     return provider in {"echo", "error"} or bool(metadata.get("fallback_used"))
+
+
+def _collect_layered(
+    config, agent, records: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """可选收集记忆学习分层指标；未启用或无证据时返回 ``None``。"""
+    if not getattr(config.metrics, "layered_memory", False):
+        return None
+    audit = collect_layered_memory(agent, records)
+    if audit is None:
+        return None
+    return compute_layered_memory(audit)
 
 
 def _parse_args() -> argparse.Namespace:

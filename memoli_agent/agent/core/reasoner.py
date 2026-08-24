@@ -9,6 +9,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
+from memoli_agent.agent.context_management import (
+    CommittedTurnStore,
+    CompactionError,
+    ContextBudgetExhausted,
+    ContextCompactionCircuitOpen,
+    ContextCompilation,
+    ContextCompiler,
+    ContextSnapshotInvalidated,
+    ContextStateError,
+    TaskAwareCompactor,
+    ToolResultPreviewer,
+    build_envelope,
+)
 from memoli_agent.agent.core.results import (
     LoopOutcome,
     StepSummary,
@@ -39,6 +52,9 @@ from memoli_agent.agent.tools.control import WorkingStateStore
 from memoli_agent.agent.tools.execution import ToolExecutionContext
 from memoli_agent.agent.tools.registry import ToolRegistry
 from memoli_agent.agent.trajectory import (
+    ASSISTANT_MESSAGE_COMMITTED,
+    TOOL_MESSAGE_COMMITTED,
+    TURN_INPUT_COMMITTED,
     NewTrajectoryEvent,
     NullTrajectoryStore,
     SpanKind,
@@ -51,6 +67,27 @@ from memoli_agent.agent.trajectory import (
     utc_now_iso,
 )
 from memoli_agent.agent.types import ChatMessage
+from memoli_agent.presentation.events import (
+    PresentationEvent,
+    PresentationEventHub,
+    PresentationEventKind,
+)
+
+
+@dataclass(slots=True)
+class _TurnCommitState:
+    """单次 turn 内的 committed 记录状态（可变，仅 run_turn 作用域存活）。
+
+    ``can_commit`` 由 ``CommittedTurnStore`` 运行时协议判定——``NullTrajectoryStore``
+    不实现 ``current_epoch``/``next_turn_seq``，天然关闭记录（§2.6）。``next_seq``
+    为下一个待分配的 message_seq（初值 1），turn_output 在 phases 层取此值续写。
+    """
+
+    epoch: int = 1
+    turn_seq: int = 0
+    next_seq: int = 1
+    can_commit: bool = False
+    capture_mode: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +107,10 @@ class Reasoner:
     hook_bus: HookBus | None = None
     stream_model: bool = False
     model_event_callback: EventCallback | None = None
+    presentation_events: PresentationEventHub | None = None
+    context_compiler: ContextCompiler | None = None
+    tool_result_previewer: ToolResultPreviewer | None = None
+    task_compactor: TaskAwareCompactor | None = None
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -117,16 +158,24 @@ class Reasoner:
         usage: dict[str, Any] = {}
         fallback_used = False
         consecutive_failed_rounds = 0
-        current_user_content = next(
+        emergency_retries = 0
+        # §5.6 loop-guard：本轮已成功压缩则抑制后续 plan，单轮最多压缩一个批次。
+        compacted_this_turn = False
+        current_user_position = next(
             (
-                message.content
-                for message in reversed(messages)
-                if message.role == "user"
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].role == "user"
             ),
-            "",
+            -1,
+        )
+        current_user_content = (
+            messages[current_user_position].content
+            if current_user_position >= 0
+            else ""
         )
         user_message_id = hashlib.sha256(
-            f"{session_key}:{current_user_content}".encode()
+            f"{trace_id}:{current_user_position}:{current_user_content}".encode()
         ).hexdigest()[:24]
         if self.working_state is not None:
             self.working_state.begin_turn(
@@ -135,10 +184,64 @@ class Reasoner:
                 max_elapsed_seconds=self.max_elapsed_seconds,
             )
 
+        # §2.3 跨轮 committed turn 状态：仅当 trajectory store 实现 CommittedTurnStore
+        # 协议时记录（NullTrajectoryStore 不实现 → 关闭记录，§2.6）。
+        commit = _TurnCommitState(
+            capture_mode=getattr(self.trajectory_store, "capture_content", "") or ""
+        )
+        # §2.3 经 isinstance 收窄到 CommittedTurnStore 协议后访问其
+        # current_epoch/next_turn_seq。pyright 不经 bool 变量收窄
+        # self.trajectory_store，故用局部 committed_store + if 直接收窄；
+        # NullTrajectoryStore 不实现该协议 → committed_store=None（§2.6）。
+        committed_store = self.trajectory_store if isinstance(
+            self.trajectory_store, CommittedTurnStore
+        ) else None
+        if committed_store is not None:
+            commit.can_commit = True
+            try:
+                commit.epoch = await committed_store.current_epoch(session_key)
+                commit.turn_seq = await committed_store.next_turn_seq(
+                    session_key, commit.epoch
+                )
+            except TrajectoryError:
+                commit.can_commit = False
+
+        async def _commit_message(event_type: str, message: ChatMessage) -> None:
+            # 记录 canonical envelope（§2.4：内容取自 to_dict()，已排除隐藏 reasoning
+            # 与训练/评价字段；凭证脱敏由 trajectory 落盘 _clean_value 统一完成）。
+            # 记录失败不阻断主控制流——committed 事件缺失由 reader 降级处理。
+            if not commit.can_commit:
+                return
+            sequence = commit.next_seq
+            commit.next_seq += 1
+            envelope = build_envelope(
+                message,
+                epoch=commit.epoch,
+                turn_seq=commit.turn_seq,
+                message_seq=sequence,
+                capture_mode=commit.capture_mode,
+            )
+            try:
+                await self.trajectory_store.record(
+                    NewTrajectoryEvent(
+                        trace_id=trace_id,
+                        span_id=root_span_id,
+                        event_type=event_type,
+                        payload=envelope,
+                    )
+                )
+            except TrajectoryError:
+                pass
+
+        async def _finish_turn(*args: Any, **kwargs: Any) -> TurnResult:
+            # 把单次 turn 的 committed 状态注入 _finish，避免在每个终止分支重复传参。
+            return await self._finish(*args, commit=commit, **kwargs)
+
         trace = TraceProjection(
             trace_id=trace_id,
             session_id=session_key,
             started_at=started_at,
+            context_epoch=commit.epoch,
             provider=provider_name,
             model=self.model_name,
         )
@@ -149,8 +252,22 @@ class Reasoner:
             kind=SpanKind.AGENT,
             name="agent-turn",
             started_at=started_at,
-            input_data={"messages": _message_dicts(messages)},
+            input_data={
+                "messages": _message_dicts(messages),
+                "session_id": session_key,
+                "current_user_message_id": user_message_id,
+                "current_user_message_index": current_user_position,
+            },
             attributes=dict(root_span_attributes or {}),
+        )
+        await self._publish_presentation(
+            PresentationEvent(
+                PresentationEventKind.TURN_STARTED,
+                session_key,
+                trace_id,
+                turn_id=trace_id,
+                status="running",
+            )
         )
         if not trace_prestarted:
             try:
@@ -161,6 +278,8 @@ class Reasoner:
                         event_type="trace_started",
                         payload={
                             "session_id": session_key,
+                            "current_user_message_id": user_message_id,
+                            "current_user_message_index": current_user_position,
                             "limits": {
                                 "max_iterations": self.max_iterations,
                                 "max_elapsed_seconds": self.max_elapsed_seconds,
@@ -173,11 +292,29 @@ class Reasoner:
                 )
             except TrajectoryError:
                 return self._trace_write_failure(trace_id)
+        # turn_input：在 trace 落盘后记录当前用户输入（不含循环内 retry 脚手架）。
+        if current_user_position >= 0:
+            await _commit_message(
+                TURN_INPUT_COMMITTED, messages[current_user_position]
+            )
+
+        # §6.6 turn 起始重放未投递的审计 outbox（best-effort，绝不阻塞主控制流）。
+        # context-state 事务已提交、压缩决定已生效；此处仅补投递上一轮因轨迹写入
+        # 临时失败而 pending/failed 的 context audit 事件（重放只记轨迹、不调
+        # commit/merge，spec 幂等）。失败与无 task_compactor 场景都静默跳过。
+        if self.task_compactor is not None:
+            try:
+                await self.task_compactor.replay_outbox(
+                    session_key=session_key,
+                    trajectory_store=self.trajectory_store,
+                )
+            except Exception:  # noqa: BLE001 — 审计重放不得阻塞主 turn
+                pass
 
         iteration = 0
         while iteration < self.max_iterations:
             if self._elapsed(started_monotonic) >= self.max_elapsed_seconds:
-                return await self._finish(
+                return await _finish_turn(
                     trace,
                     root_span,
                     TerminationReason.BUDGET_EXHAUSTED,
@@ -202,6 +339,90 @@ class Reasoner:
             visible_messages, status_revision = self._assemble_model_context(
                 working_messages, session_key
             )
+            compiled_metadata: dict[str, Any] = {}
+            iteration_tools = list(tools or ())
+            # 仅 context_compiler 非空分支才 compile 赋值；reactive 块经同一
+            # 守卫到达，调用 _apply_compaction_plan 前用 assert 收窄（pyright
+            # 无法跨两个独立 if 关联“context_compiler 非空 ⟹ compilation 已赋值”）。
+            compilation: ContextCompilation | None = None
+            if self.context_compiler is not None:
+                try:
+                    compilation = self.context_compiler.compile(
+                        session_key=session_key,
+                        session_instance_id=session_instance_id,
+                        messages=visible_messages,
+                        tools=iteration_tools,
+                        working_state_revision=status_revision,
+                        compacted_this_turn=compacted_this_turn,
+                        epoch=commit.epoch,
+                        revoked_tool_names=(
+                            self.tool_registry.revoked_tool_names
+                            if self.tool_registry
+                            else frozenset()
+                        ),
+                    )
+                except (ContextBudgetExhausted, ContextCompactionCircuitOpen) as exc:
+                    return await _finish_turn(
+                        trace,
+                        root_span,
+                        TerminationReason.BUDGET_EXHAUSTED,
+                        str(exc),
+                        iteration,
+                        steps,
+                        usage,
+                        fallback_used,
+                        error_type=exc.error_type,
+                        decision="context-budget-exhausted",
+                    )
+                except ContextSnapshotInvalidated as exc:
+                    # §7.2 安全撤销 fail-closed：snapshot 因能力撤销失效，编译拒绝
+                    # 用其冻结 schema（仍含已撤销能力）向模型暴露；立即结束 turn 为
+                    # 失败，不静默替换。恢复需新 epoch 重新冻结当前 schema。
+                    return await _finish_turn(
+                        trace,
+                        root_span,
+                        TerminationReason.FAILED,
+                        str(exc),
+                        iteration,
+                        steps,
+                        usage,
+                        fallback_used,
+                        error_type=exc.error_type,
+                        decision="snapshot-invalidated",
+                    )
+                # §5.2/§5.6：soft/hard 触发后经统一协调器压缩 plan.batch 并重编译；
+                # 压缩失败保原视图并计数，重编译后 hard 仍超预算才显式结束。
+                try:
+                    compilation, compacted_this_turn = (
+                        await self._apply_compaction_plan(
+                            compilation,
+                            compacted_this_turn=compacted_this_turn,
+                            session_key=session_key,
+                            session_instance_id=session_instance_id,
+                            visible_messages=visible_messages,
+                            tools=iteration_tools,
+                            status_revision=status_revision,
+                            trace_id=trace_id,
+                            root_span_id=root_span_id,
+                            commit=commit,
+                        )
+                    )
+                except (ContextBudgetExhausted, CompactionError) as exc:
+                    return await _finish_turn(
+                        trace,
+                        root_span,
+                        TerminationReason.BUDGET_EXHAUSTED,
+                        str(exc),
+                        iteration,
+                        steps,
+                        usage,
+                        fallback_used,
+                        error_type=exc.error_type,
+                        decision="context-compaction-hard-failed",
+                    )
+                visible_messages = list(compilation.messages)
+                iteration_tools = list(compilation.tools)
+                compiled_metadata = compilation.metadata()
             llm_span_id = new_span_id()
             llm_started_at = utc_now_iso()
             llm_span = SpanProjection(
@@ -213,12 +434,13 @@ class Reasoner:
                 started_at=llm_started_at,
                 input_data={
                     "messages": _message_dicts(visible_messages),
-                    "tools": tools or [],
+                    "tools": iteration_tools,
                 },
                 attributes={
                     "iteration": iteration,
                     "model": self.model_name,
                     "working_state_revision": status_revision,
+                    **compiled_metadata,
                     **provider_metadata,
                 },
             )
@@ -237,7 +459,7 @@ class Reasoner:
                             profile=provider_metadata["profile"],
                             capabilities=tuple(provider_metadata["capabilities"]),
                             messages=tuple(_message_dicts(visible_messages)),
-                            tools=tuple(tools or ()),
+                            tools=tuple(iteration_tools),
                         ),
                     )
                 # 模型请求先落盘，确保后续调用可以被完整审计。
@@ -249,8 +471,9 @@ class Reasoner:
                         payload={
                             "iteration": iteration,
                             "messages": _message_dicts(visible_messages),
-                            "tools": tools or [],
+                            "tools": iteration_tools,
                             "working_state_revision": status_revision,
+                            "context_compilation": compiled_metadata,
                             **provider_metadata,
                         },
                         trace=trace,
@@ -261,8 +484,76 @@ class Reasoner:
                 return self._trace_write_failure(trace_id, iteration, steps, usage)
 
             response = _normalize_tool_call_ids(
-                await self._chat_with_fallback(visible_messages, tools), iteration
+                await self._chat_with_fallback(
+                    visible_messages,
+                    iteration_tools,
+                    session_key=session_key,
+                    trace_id=trace_id,
+                ),
+                iteration,
             )
+            if (
+                response.error_type == "provider-context-length"
+                and self.context_compiler is not None
+                and emergency_retries
+                < self.context_compiler.settings.emergency_retry_limit
+            ):
+                previous_hash = str(compiled_metadata.get("context_hash") or "")
+                previous_tokens = int(
+                    compiled_metadata.get("estimated_input_tokens") or 0
+                )
+                # §5.1/§5.7：emergency 经统一协调器——确定性 shed 重编译（不调
+                # LLM 压缩、不提交 archive），熔断/编译失败返回原 compilation
+                # （同 hash → improved 判否）。improved 要求 hash 不同且 token 更少。
+                # 上方 context_compiler 非空 ⟹ 循环顶部已 compile 赋值。
+                assert compilation is not None
+                shed, _ = await self._apply_compaction_plan(
+                    compilation,
+                    compacted_this_turn=compacted_this_turn,
+                    session_key=session_key,
+                    session_instance_id=session_instance_id,
+                    visible_messages=visible_messages,
+                    tools=tools,
+                    status_revision=status_revision,
+                    trace_id=trace_id,
+                    root_span_id=root_span_id,
+                    commit=commit,
+                    working_messages=working_messages,
+                    emergency=True,
+                )
+                improved = (
+                    shed.context_hash != previous_hash
+                    and shed.budget.estimated_input_tokens < previous_tokens
+                )
+                if improved:
+                    emergency_retries += 1
+                    await self._record_decision(
+                        trace_id,
+                        root_span_id,
+                        iteration,
+                        "context-emergency-retry",
+                        {
+                            "before_context_hash": previous_hash,
+                            "after_context_hash": shed.context_hash,
+                            "before_tokens": previous_tokens,
+                            "after_tokens": shed.budget.estimated_input_tokens,
+                        },
+                    )
+                    visible_messages = list(shed.messages)
+                    iteration_tools = list(shed.tools)
+                    compiled_metadata = shed.metadata()
+                    response = _normalize_tool_call_ids(
+                        await self._chat_with_fallback(
+                            visible_messages,
+                            iteration_tools,
+                            session_key=session_key,
+                            trace_id=trace_id,
+                        ),
+                        iteration,
+                    )
+                # §5.7：无法改善（压缩失败/熔断/最小必需仍超限/新请求未变小）
+                # 时不重试，保持原 Provider 错误由后续 response.error_type 分支
+                # 稳定结束，不以相同输入循环重试或切换窗口更小的 Provider。
             if self.hook_bus is not None:
                 await self.hook_bus.observe(
                     HookName.MODEL_AFTER,
@@ -291,6 +582,11 @@ class Reasoner:
                 )
             fallback_used = fallback_used or response.fallback_used
             _merge_usage(usage, response.usage)
+            cache_usage = (
+                self.context_compiler.record_provider_usage(session_key, response.usage)
+                if self.context_compiler is not None
+                else {}
+            )
             llm_finished = SpanProjection(
                 **{
                     **_span_values(llm_span),
@@ -307,7 +603,12 @@ class Reasoner:
                         trace_id=trace_id,
                         span_id=llm_span_id,
                         event_type="model_responded",
-                        payload={"iteration": iteration, **_response_dict(response)},
+                        payload={
+                            "iteration": iteration,
+                            "context_compilation": compiled_metadata,
+                            "cache_usage": cache_usage,
+                            **_response_dict(response),
+                        },
                         trace=TraceProjection(
                             **{
                                 **_trace_values(trace),
@@ -333,7 +634,7 @@ class Reasoner:
                         usage=response.usage,
                     )
                 )
-                return await self._finish(
+                return await _finish_turn(
                     trace,
                     root_span,
                     TerminationReason.FAILED,
@@ -359,7 +660,7 @@ class Reasoner:
                             usage=response.usage,
                         )
                     )
-                    return await self._finish(
+                    return await _finish_turn(
                         trace,
                         root_span,
                         TerminationReason.COMPLETED,
@@ -399,7 +700,7 @@ class Reasoner:
                 continue
 
             if self.tool_registry is None:
-                return await self._finish(
+                return await _finish_turn(
                     trace,
                     root_span,
                     TerminationReason.FAILED,
@@ -413,12 +714,16 @@ class Reasoner:
                     provider=response.provider,
                 )
 
-            working_messages.append(self._assistant_tool_call_message(response))
+            assistant_tool_call = self._assistant_tool_call_message(response)
+            working_messages.append(assistant_tool_call)
+            # assistant tool-call 提交点（不含 completion-retry 脚手架与纯文本响应，
+            # 后者由 phases 层 turn_output_committed 记录）。
+            await _commit_message(ASSISTANT_MESSAGE_COMMITTED, assistant_tool_call)
             tool_messages: list[ChatMessage] = []
             tool_results: list[tuple[ToolCall, ToolResult]] = []
             for index, tool_call in enumerate(response.tool_calls):
                 if self._elapsed(started_monotonic) >= self.max_elapsed_seconds:
-                    return await self._finish(
+                    return await _finish_turn(
                         trace,
                         root_span,
                         TerminationReason.BUDGET_EXHAUSTED,
@@ -462,6 +767,18 @@ class Reasoner:
                 except TrajectoryError:
                     return self._trace_write_failure(trace_id, iteration, steps, usage)
 
+                await self._publish_presentation(
+                    PresentationEvent(
+                        PresentationEventKind.TOOL_STARTED,
+                        session_key,
+                        trace_id,
+                        tool_call.name,
+                        turn_id=trace_id,
+                        step_id=tool_call_id,
+                        status="running",
+                    )
+                )
+                tool_clock = time.monotonic()
                 result = await self.tool_registry.execute(
                     tool_call.name,
                     tool_call.arguments,
@@ -476,6 +793,23 @@ class Reasoner:
                     ),
                 )
                 tool_results.append((tool_call, result))
+                await self._publish_presentation(
+                    PresentationEvent(
+                        PresentationEventKind.TOOL_FINISHED,
+                        session_key,
+                        trace_id,
+                        tool_call.name,
+                        turn_id=trace_id,
+                        step_id=tool_call_id,
+                        status=result.effective_status,
+                        elapsed_seconds=self._elapsed(tool_clock),
+                        error_type=(
+                            ""
+                            if result.success
+                            else str(result.metadata.get("error") or "tool-error")
+                        ),
+                    )
+                )
                 if self.working_state is not None:
                     artifact = str(
                         result.metadata.get("path")
@@ -494,6 +828,49 @@ class Reasoner:
                     "executed_arguments", tool_call.arguments
                 )
                 raw_content = result.raw_content or result.content
+                model_content = result.content
+                preview_metadata: dict[str, Any] = {}
+                if self.tool_result_previewer is not None:
+                    governed_content = self.trajectory_store.sanitize_for_capture(
+                        raw_content
+                    )
+                    try:
+                        raw_event = await self.trajectory_store.record(
+                            NewTrajectoryEvent(
+                                trace_id=trace_id,
+                                span_id=tool_span_id,
+                                event_type="tool_result_payload_stored",
+                                payload={
+                                    "tool_call_id": tool_call_id,
+                                    "name": tool_call.name,
+                                    "raw_content": governed_content,
+                                },
+                            )
+                        )
+                    except TrajectoryError:
+                        return self._trace_write_failure(
+                            trace_id, iteration, steps, usage
+                        )
+                    payload_ref = (
+                        f"trajectory-payload:{raw_event.payload_id}"
+                        if raw_event.payload_id is not None
+                        else f"trajectory-event:{trace_id}:{raw_event.sequence}"
+                    )
+                    preview = self.tool_result_previewer.freeze(
+                        session_key=session_key,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_call.name,
+                        content=governed_content,
+                        payload_ref=payload_ref,
+                        epoch=commit.epoch,
+                    )
+                    if preview.transformed:
+                        model_content = preview.preview
+                    preview_metadata = {
+                        "preview_id": preview.preview_id,
+                        "payload_ref": preview.payload_ref,
+                        "content_hash": preview.content_hash,
+                    }
                 tool_finished = SpanProjection(
                     **{
                         **_span_values(tool_span),
@@ -505,7 +882,8 @@ class Reasoner:
                         },
                         "output_data": {
                             "raw_content": raw_content,
-                            "model_content": result.content,
+                            "model_content": model_content,
+                            "preview": preview_metadata,
                             "metadata": result.metadata,
                             "status": result.effective_status,
                         },
@@ -530,7 +908,8 @@ class Reasoner:
                                 "original_arguments": tool_call.arguments,
                                 "executed_arguments": executed_arguments,
                                 "raw_content": raw_content,
-                                "model_content": result.content,
+                                "model_content": model_content,
+                                "preview": preview_metadata,
                                 "metadata": result.metadata,
                             },
                             span=tool_finished,
@@ -540,6 +919,16 @@ class Reasoner:
                     return self._trace_write_failure(trace_id, iteration, steps, usage)
                 if tool_call.name == "update_working_checkpoint":
                     revision = result.metadata.get("revision")
+                    await self._publish_presentation(
+                        PresentationEvent(
+                            PresentationEventKind.CHECKPOINT_CHANGED,
+                            session_key,
+                            trace_id,
+                            turn_id=trace_id,
+                            step_id=tool_call_id,
+                            status="updated" if result.success else "failed",
+                        )
+                    )
                     try:
                         await self.trajectory_store.record(
                             NewTrajectoryEvent(
@@ -558,14 +947,15 @@ class Reasoner:
                         return self._trace_write_failure(
                             trace_id, iteration, steps, usage
                         )
-                tool_messages.append(
-                    ChatMessage(
-                        role="tool",
-                        content=result.content,
-                        tool_call_id=tool_call_id,
-                        name=tool_call.name,
-                    )
+                tool_message = ChatMessage(
+                    role="tool",
+                    content=model_content,
+                    tool_call_id=tool_call_id,
+                    name=tool_call.name,
                 )
+                tool_messages.append(tool_message)
+                # tool 结果提交点：保留 tool_call_id/name 以维持工具协议配对。
+                await _commit_message(TOOL_MESSAGE_COMMITTED, tool_message)
                 if bool(result.metadata.get("needs_user")):
                     steps.append(
                         StepSummary(
@@ -577,7 +967,7 @@ class Reasoner:
                             usage=response.usage,
                         )
                     )
-                    return await self._finish(
+                    return await _finish_turn(
                         trace,
                         root_span,
                         TerminationReason.NEEDS_USER,
@@ -608,7 +998,7 @@ class Reasoner:
                 )
             )
             if consecutive_failed_rounds >= self.no_progress_limit:
-                return await self._finish(
+                return await _finish_turn(
                     trace,
                     root_span,
                     TerminationReason.FAILED,
@@ -630,7 +1020,7 @@ class Reasoner:
             ):
                 return self._trace_write_failure(trace_id, iteration, steps, usage)
 
-        return await self._finish(
+        return await _finish_turn(
             trace,
             root_span,
             TerminationReason.BUDGET_EXHAUSTED,
@@ -665,11 +1055,152 @@ class Reasoner:
         clean.append(ChatMessage(role="system", content=rendered.content))
         return clean, rendered.revision
 
+    async def _apply_compaction_plan(
+        self,
+        compilation: ContextCompilation,
+        *,
+        compacted_this_turn: bool,
+        session_key: str,
+        session_instance_id: str,
+        visible_messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        status_revision: int,
+        trace_id: str,
+        root_span_id: str,
+        commit: _TurnCommitState,
+        working_messages: list[ChatMessage] | None = None,
+        emergency: bool = False,
+    ) -> tuple[ContextCompilation, bool]:
+        """§5.1/§5.2/§5.6/§5.7：统一压缩协调器——soft/hard/emergency 共用同一入口。
+
+        按 plan、execute、validate、commit 顺序执行。emergency 分支走确定性 shed
+        （不调用 LLM 压缩、不提交 archive，design「无 compaction provider 时只允许
+        确定性降载，不得把机械截断标记成 archive」），熔断/编译失败/最小必需仍超
+        限时返回原 compilation（同 hash → 调用方 ``improved`` 判否），让原
+        context-length 错误稳定传播。soft/hard 分支对 plan.batch 执行任务感知压缩
+        并在提交后重编译（loop-guard）；压缩 Provider/校验失败时保原可发送视图、
+        计数失败且不标记源 turn 已覆盖（原视图已通过预算，合法请求存在，故 soft/
+        hard 均不结束）；重编译后仍超预算时 soft 保原视图，hard 视为无法生成合法
+        请求而显式结束（抛出由调用方捕获）。
+        """
+        if emergency:
+            # §5.1/§5.7：emergency 经统一协调器——确定性 shed 重编译，不调 LLM
+            # 压缩、不提交 archive。熔断/最小必需仍超限返回原 compilation（同 hash）。
+            assert working_messages is not None and self.context_compiler is not None
+            visible, _ = self._assemble_model_context(working_messages, session_key)
+            try:
+                recompiled = self.context_compiler.compile(
+                    session_key=session_key,
+                    session_instance_id=session_instance_id,
+                    messages=visible,
+                    tools=list(tools or ()),
+                    working_state_revision=status_revision,
+                    emergency=True,
+                    epoch=commit.epoch,
+                    revoked_tool_names=(
+                        self.tool_registry.revoked_tool_names
+                        if self.tool_registry
+                        else frozenset()
+                    ),
+                )
+            except (ContextBudgetExhausted, ContextCompactionCircuitOpen):
+                return compilation, True
+            return recompiled, True
+        plan = compilation.compaction_plan
+        if (
+            plan is None
+            or plan.mode not in ("soft", "hard")
+            or compacted_this_turn
+            or self.task_compactor is None
+            or not plan.batch
+        ):
+            return compilation, compacted_this_turn
+        # 到此必有 context_compiler（compilation.compaction_plan 由其 compile() 产出；
+        # 与 emergency 分支 1059 同一不变式），显式收窄 Optional 供下方
+        # record_compaction_failure/clear_compaction_failures/compile 访问。
+        assert self.context_compiler is not None
+        try:
+            await self.task_compactor.compact(
+                session_key=session_key,
+                messages=list(plan.batch),
+                trace_id=trace_id,
+                parent_span_id=root_span_id,
+                trajectory_store=self.trajectory_store,
+                target_tokens=plan.target_tokens,
+                parent_archive_refs=plan.parent_archive_refs,
+                epoch=commit.epoch,
+            )
+        except ContextStateError:
+            # §6.3：并发/重试 coverage/generation 冲突——commit_archive 事务原子
+            # 回滚，无孤立 archive、未标记源 turn 覆盖。冲突意味着 Provider 已产出
+            # 合法 archive（仅提交时撞并发 archive 的 coverage/generation），故视同
+            # 成功路径：清熔断 + 走下方 fresh re-compile（重读 coverage，冲突批次
+            # refs 已被并发 archive 覆盖 → _drop_covered_groups 排除；correction 15
+            # 不得复用 stale compilation）。compacted_this_turn 置位防本轮再压缩。
+            # 不计熔断失败（非 Provider/校验故障；spec「事务无法提交」的有界重试
+            # 即此 fresh re-compile）。
+            pass
+        except CompactionError:
+            # §5.2/§5.6：压缩 Provider/校验失败——保原可发送视图、计数失败、不标记
+            # 源 turn 已覆盖。原视图已通过预算（合法请求存在），故 soft/hard 均不结束。
+            self.context_compiler.record_compaction_failure(session_key)
+            return compilation, True
+        self.context_compiler.clear_compaction_failures(session_key)
+        # §6.5：direct compact 已提交（frontier +1），若超 archive_frontier_tokens/
+        # max_items 则 best-effort 合并最旧相邻 frontier。合并失败不阻断本轮重编译
+        # （merge_frontier 吞已知异常；此处兜底防未知异常崩溃本轮——spec「原有
+        # frontier 保持不变」+ §6.4 bounded injection 兜底注入）。显式 None-guard
+        # 收窄 Optional，避免新增 pyright 报错（context_compiler.settings 访问）。
+        if self.task_compactor is not None and self.context_compiler is not None:
+            settings = self.context_compiler.settings
+            try:
+                await self.task_compactor.merge_frontier(
+                    session_key=session_key,
+                    trace_id=trace_id,
+                    parent_span_id=root_span_id,
+                    trajectory_store=self.trajectory_store,
+                    epoch=commit.epoch,
+                    frontier_tokens=settings.archive_frontier_tokens,
+                    frontier_max_items=settings.archive_frontier_max_items,
+                )
+            except Exception:  # noqa: BLE001 — best-effort 合并不阻断重编译
+                pass
+        try:
+            recompiled = self.context_compiler.compile(
+                session_key=session_key,
+                session_instance_id=session_instance_id,
+                messages=visible_messages,
+                tools=list(tools or ()),
+                working_state_revision=status_revision,
+                compacted_this_turn=True,
+                epoch=commit.epoch,
+            )
+        except ContextBudgetExhausted:
+            # 重编译仍超预算：soft 保原视图，hard 显式结束。
+            if plan.mode == "hard":
+                raise
+            return compilation, True
+        return recompiled, True
+
     async def _chat_with_fallback(
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None,
+        *,
+        session_key: str,
+        trace_id: str,
     ) -> LLMResponse:
+        callback = self._build_model_event_callback(session_key, trace_id)
+        await self._publish_presentation(
+            PresentationEvent(
+                PresentationEventKind.MODEL_STARTED,
+                session_key,
+                trace_id,
+                turn_id=trace_id,
+                step_id="model",
+                status="running",
+            )
+        )
         try:
             return await invoke_provider(
                 self.provider,
@@ -677,10 +1208,37 @@ class Reasoner:
                 tools,
                 model=self.model_name,
                 stream=self.stream_model,
-                on_event=self.model_event_callback,
+                on_event=callback,
             )
         except ProviderError as primary_error:
-            if self.fallback_provider is not None and not primary_error.partial_stream:
+            if (
+                self.stream_model
+                and primary_error.error_type == "provider-response-protocol"
+            ):
+                try:
+                    response = await invoke_provider(
+                        self.provider,
+                        messages,
+                        tools,
+                        model=self.model_name,
+                        stream=False,
+                        on_event=callback,
+                    )
+                except ProviderError as recovery_error:
+                    return self._error_response(recovery_error)
+                return replace(
+                    response,
+                    fallback_reason="stream-protocol-recovery",
+                    attempt_count=max(1, primary_error.attempt)
+                    + max(1, response.attempt_count),
+                    attempts=(*primary_error.attempts, *response.attempts),
+                    partial_stream=primary_error.partial_stream,
+                )
+            if (
+                self.fallback_provider is not None
+                and not primary_error.partial_stream
+                and primary_error.error_type != "provider-context-length"
+            ):
                 try:
                     response = await invoke_provider(
                         self.fallback_provider,
@@ -688,7 +1246,7 @@ class Reasoner:
                         tools,
                         model=self.model_name,
                         stream=self.stream_model,
-                        on_event=self.model_event_callback,
+                        on_event=callback,
                     )
                 except ProviderError as fallback_error:
                     return self._error_response(fallback_error, fallback_used=True)
@@ -723,6 +1281,39 @@ class Reasoner:
                     capabilities=response.capabilities,
                 )
             return self._error_response(primary_error)
+
+    def _build_model_event_callback(
+        self,
+        session_key: str,
+        trace_id: str,
+    ) -> EventCallback | None:
+        if self.model_event_callback is None and self.presentation_events is None:
+            return None
+
+        async def callback(event: Any) -> None:
+            if self.model_event_callback is not None:
+                await self.model_event_callback(event)
+            if self.presentation_events is not None:
+                try:
+                    await self.presentation_events.publish_model_event(
+                        session_key,
+                        trace_id,
+                        event,
+                    )
+                except Exception:
+                    # 表现层是 Observer，故障不能改变模型与工具行为。
+                    return
+
+        return callback
+
+    async def _publish_presentation(self, event: PresentationEvent) -> None:
+        if self.presentation_events is None:
+            return
+        try:
+            await self.presentation_events.publish(event)
+        except Exception:
+            # 表现层是 Observer，任何故障都不能改变 Agent 行为。
+            return
 
     async def _record_decision(
         self,
@@ -783,6 +1374,65 @@ class Reasoner:
         )
         return trace_id, span_id
 
+    async def cancel_trace(
+        self,
+        trace_id: str,
+        root_span_id: str,
+        session_key: str,
+    ) -> None:
+        """把用户取消写成可审计终态；写入失败不得掩盖取消控制流。"""
+
+        ended_at = utc_now_iso()
+        provider_name = str(
+            getattr(self.provider, "name", type(self.provider).__name__)
+        )
+        try:
+            await self.trajectory_store.record(
+                NewTrajectoryEvent(
+                    trace_id=trace_id,
+                    span_id=root_span_id,
+                    event_type="trace_cancelled",
+                    payload={
+                        "termination_reason": "cancelled",
+                        "error_type": "user-cancelled",
+                    },
+                    trace=TraceProjection(
+                        trace_id=trace_id,
+                        session_id=session_key,
+                        started_at=ended_at,
+                        ended_at=ended_at,
+                        status="cancelled",
+                        termination_reason="cancelled",
+                        provider=provider_name,
+                        model=self.model_name,
+                    ),
+                    span=SpanProjection(
+                        span_id=root_span_id,
+                        trace_id=trace_id,
+                        parent_span_id=None,
+                        kind=SpanKind.AGENT,
+                        name="agent-turn",
+                        started_at=ended_at,
+                        ended_at=ended_at,
+                        status="cancelled",
+                        output_data={"termination_reason": "cancelled"},
+                        error_type="user-cancelled",
+                    ),
+                )
+            )
+        except TrajectoryError:
+            return
+        await self._publish_presentation(
+            PresentationEvent(
+                PresentationEventKind.TURN_CANCELLED,
+                session_key,
+                trace_id,
+                turn_id=trace_id,
+                status="cancelled",
+                error_type="user-cancelled",
+            )
+        )
+
     async def _finish(
         self,
         trace: TraceProjection,
@@ -797,6 +1447,7 @@ class Reasoner:
         error_type: str | None,
         decision: str,
         provider: str = "",
+        commit: _TurnCommitState | None = None,
     ) -> TurnResult:
         if not await self._record_decision(
             trace.trace_id,
@@ -858,6 +1509,39 @@ class Reasoner:
             )
         except TrajectoryError:
             return self._trace_write_failure(trace.trace_id, iterations, steps, usage)
+        terminal_kind = (
+            PresentationEventKind.TURN_COMPLETED
+            if reason in {TerminationReason.COMPLETED, TerminationReason.NEEDS_USER}
+            else PresentationEventKind.TURN_FAILED
+        )
+        await self._publish_presentation(
+            PresentationEvent(
+                terminal_kind,
+                trace.session_id,
+                trace.trace_id,
+                turn_id=trace.trace_id,
+                status=reason.value,
+                usage=tuple(
+                    sorted(
+                        (key, int(value))
+                        for key, value in usage.items()
+                        if isinstance(value, int)
+                    )
+                ),
+                error_type=error_type or "",
+            )
+        )
+        # 跨轮 committed 状态：commit 为 None 或不可提交时全为 0（phases 据此跳过
+        # turn_output）。经 ``commit is not None`` 直接收窄（pyright 不经
+        # bool 变量收窄）。
+        if commit is not None and commit.can_commit:
+            committed_epoch = commit.epoch
+            committed_turn_seq = commit.turn_seq
+            committed_output_seq = commit.next_seq
+        else:
+            committed_epoch = 0
+            committed_turn_seq = 0
+            committed_output_seq = 0
         return TurnResult(
             trace_id=trace.trace_id,
             response=response,
@@ -867,6 +1551,9 @@ class Reasoner:
             usage=dict(usage),
             fallback_used=fallback_used,
             error_type=error_type,
+            committed_epoch=committed_epoch,
+            committed_turn_seq=committed_turn_seq,
+            committed_output_seq=committed_output_seq,
         )
 
     def _trace_write_failure(

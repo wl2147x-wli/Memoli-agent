@@ -13,6 +13,13 @@ from benchmarks.datasets.base import (
     BenchmarkQuestion,
     BenchmarkSample,
 )
+from benchmarks.metrics.layered_memory import (
+    GovernanceCandidate,
+    LayeredMemoryAudit,
+    RecallAttempt,
+    scan_memory_manage_calls,
+)
+from memoli_agent.agent.memory.governance import MemoryScope
 from memoli_agent.agent.memory.runtime import MemoryMutation, MemoryQuery
 from memoli_agent.bootstrap.app import AppRuntime, build_app_runtime
 from memoli_agent.bootstrap.config import AppConfig, load_config
@@ -31,6 +38,8 @@ class MemoliAgentAdapter:
         self.split = split
         self.runtime: AppRuntime | None = None
         self.sample_workspace: Path | None = None
+        # 记忆学习分层评估：追踪本适配器显式发起的召回是否命中。
+        self._recall_attempts: list[bool] = []
 
     async def reset(self, sample_id: str) -> None:
         if self.runtime is not None:
@@ -53,6 +62,7 @@ class MemoliAgentAdapter:
         # benchmark 也走完整生命周期，保证 SQLite 轨迹等资源已经就绪。
         await self.runtime.start()
         self.sample_workspace = sample_workspace
+        self._recall_attempts = []
 
     async def ingest(self, sample: BenchmarkSample) -> None:
         runtime = self._runtime()
@@ -110,6 +120,7 @@ class MemoliAgentAdapter:
                 MemoryQuery(query=question.question, limit=5)
             )
             retrieved_context = [item.content for item in result.items]
+            self._recall_attempts.append(bool(result.items))
 
         outbound = await runtime.runner.handle_inbound(
             InboundMessage(
@@ -143,6 +154,36 @@ class MemoliAgentAdapter:
             await self.runtime.shutdown()
         self.runtime = None
         self.sample_workspace = None
+        self._recall_attempts = []
+
+    def memory_audit(self) -> LayeredMemoryAudit:
+        """为记忆学习分层评估提供既有审计证据。
+
+        全部 best-effort 且守护：任一信号不可得时对应证据为空，指标为
+        ``None``，绝不抛出。memory_manage 调用从只读轨迹扫描得到，召回命中
+        由本适配器显式发起的召回追踪得到，Candidate 来自治理服务。
+        """
+        audit = LayeredMemoryAudit()
+        runtime = self.runtime
+        if runtime is not None and runtime.memory_runtime is not None:
+            governance = runtime.memory_runtime.governance_service
+            if governance is not None:
+                try:
+                    rows = governance.list_candidates(MemoryScope("user", "default"))
+                    audit.governance_candidates = [
+                        GovernanceCandidate(status=str(row.get("status") or ""))
+                        for row in rows
+                    ]
+                except Exception:
+                    audit.governance_candidates = []
+        audit.recall_attempts = [
+            RecallAttempt(hit=hit) for hit in self._recall_attempts
+        ]
+        if self.sample_workspace is not None:
+            trajectory_db = self.sample_workspace / "trajectories.db"
+            if trajectory_db.exists():
+                audit.memory_manage_calls = scan_memory_manage_calls(trajectory_db)
+        return audit
 
     def _runtime(self) -> AppRuntime:
         if self.runtime is None:

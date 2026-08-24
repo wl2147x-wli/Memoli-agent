@@ -57,3 +57,9 @@ class MessageBus:
         """
 
         return await self._outbound.get()
+
+    @property
+    def inbound_size(self) -> int:
+        """返回尚未开始处理的消息数，仅用于本地背压展示。"""
+
+        return self._inbound.qsize()

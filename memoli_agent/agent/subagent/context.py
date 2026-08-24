@@ -86,9 +86,7 @@ def parse_structured_result(
         remaining_work=_str_tuple(payload.get("remaining_work")),
         usage=dict(payload.get("usage") or usage or {}),
         error=(
-            dict(payload["error"])
-            if isinstance(payload.get("error"), dict)
-            else None
+            dict(payload["error"]) if isinstance(payload.get("error"), dict) else None
         ),
         unstructured_fallback=False,
     )

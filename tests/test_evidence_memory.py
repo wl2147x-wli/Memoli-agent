@@ -208,7 +208,7 @@ def test_v2_migration_removes_global_hash_uniqueness(tmp_path: Path) -> None:
     _downgrade_fixture_to_v2(database)
 
     migrated = SQLiteMemoryStore(database)
-    assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == 7
     other = migrated.append_claim(
         explicit_memory("跨 scope 内容", scope=MemoryScope("project", "other"))
     )
@@ -254,7 +254,7 @@ def test_v2_migration_failure_rolls_back_and_can_resume(
 
     monkeypatch.setattr(sqlite_store_module, "_execute_sql_script", original)
     recovered = SQLiteMemoryStore(database)
-    assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert recovered._connection.execute("PRAGMA user_version").fetchone()[0] == 7
     assert recovered.find_exact_claim("迁移中断恢复", MemoryScope())
 
 
@@ -371,6 +371,108 @@ def test_memory_manage_requires_current_user_basis(tmp_path: Path) -> None:
             assert item_id not in listed.content
 
     asyncio.run(scenario())
+
+
+def test_memory_manage_authoritative_basis_sensitivity_and_atomic_correction(
+    tmp_path: Path,
+) -> None:
+    from memoli_agent.agent.memory.retriever import SQLiteMemoryRetriever
+    from memoli_agent.agent.memory.runtime import MemoryRuntime
+
+    store = SQLiteMemoryStore(tmp_path / "memory.db")
+    tool = MemoryManageTool(MemoryRuntime(store, SQLiteMemoryRetriever(store)))
+
+    async def scenario() -> None:
+        first_context = ToolExecutionContext(
+            "trace-1",
+            "cli:local",
+            "call-1",
+            "msg-1",
+            "请记住：我对花生过敏。",
+        )
+        with tool_context(first_context):
+            unrelated = await tool.run(
+                {
+                    "action": "remember",
+                    "content": "我喜欢网球。",
+                    "basis_quote": "请记住：我对花生过敏。",
+                }
+            )
+            assert not unrelated.success
+            remembered = await tool.run(
+                {
+                    "action": "remember",
+                    "content": "我对花生过敏。",
+                    "basis_quote": "请记住：我对花生过敏。",
+                    "fact_type": "health",
+                    "sensitivity": "public",
+                }
+            )
+            payload = json.loads(remembered.content)
+            claim_id = payload["claim_id"]
+            assert payload["current_user_message_id"] == "msg-1"
+            row = store.claim_row(claim_id)
+            assert row is not None
+            assert row["content"] == "我对花生过敏。"
+            assert row["sensitivity"] == "sensitive"
+            evidence = store._connection.execute(  # noqa: SLF001
+                "SELECT * FROM evidence WHERE claim_id=?", (claim_id,)
+            ).fetchone()
+            assert evidence["verified"] == 1
+            assert evidence["ref_id"] == "msg-1"
+
+        correction_context = ToolExecutionContext(
+            "trace-2",
+            "cli:local",
+            "call-2",
+            "msg-2",
+            "记住：我现在没有花生过敏。",
+        )
+        with tool_context(correction_context):
+            corrected = await tool.run(
+                {
+                    "action": "correct",
+                    "content": "我现在没有花生过敏。",
+                    "basis_quote": "记住：我现在没有花生过敏。",
+                    "entity_id": claim_id,
+                    "expected_revision": 0,
+                    "fact_type": "health",
+                }
+            )
+            assert corrected.success
+            correction_id = json.loads(corrected.content)["claim_id"]
+            assert store.claim_row(claim_id)["status"] == "superseded"  # type: ignore[index]
+            relations = store._connection.execute(  # noqa: SLF001
+                "SELECT relation FROM claim_relations WHERE source_claim_id=? "
+                "AND target_claim_id=? ORDER BY relation",
+                (correction_id, claim_id),
+            ).fetchall()
+            assert [row[0] for row in relations] == ["corrects", "supersedes"]
+            before_count = store._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM claims"
+            ).fetchone()[0]
+            stale = await tool.run(
+                {
+                    "action": "correct",
+                    "content": "我现在没有花生过敏。",
+                    "basis_quote": "我现在没有花生过敏。",
+                    "entity_id": claim_id,
+                    "expected_revision": 0,
+                }
+            )
+            assert not stale.success
+            assert store._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM claims"
+            ).fetchone()[0] == before_count
+            assert store._connection.execute(  # noqa: SLF001
+                "SELECT 1 FROM evidence WHERE claim_id=? AND ref_id='msg-1'",
+                (claim_id,),
+            ).fetchone()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
 
 
 def test_consolidation_is_candidate_only_and_idempotent(tmp_path: Path) -> None:

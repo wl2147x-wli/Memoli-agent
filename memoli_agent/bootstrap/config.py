@@ -55,6 +55,9 @@ class LLMModelProfileConfig:
     model: str
     capabilities: list[str] = field(default_factory=lambda: ["text"])
     max_output_tokens: int = 8192
+    context_window_tokens: int = 131_072
+    context_safety_margin_tokens: int = 4_096
+    token_estimator: str = "conservative"
     temperature: float | None = None
 
     def __post_init__(self) -> None:
@@ -72,8 +75,18 @@ class LLMModelProfileConfig:
             raise ValueError(f"未知模型能力：{sorted(unknown)}")
         if "text" not in self.capabilities:
             self.capabilities.insert(0, "text")
+        self.token_estimator = self.token_estimator.strip().lower()
+        if self.token_estimator not in {"conservative", "provider"}:
+            raise ValueError("模型 Profile token_estimator 配置无效。")
         if not self.provider or not self.model or self.max_output_tokens <= 0:
             raise ValueError("模型 Profile 必须包含 provider、model 和正输出上限。")
+        if self.context_window_tokens <= 0 or self.context_safety_margin_tokens < 0:
+            raise ValueError("模型 Profile 上下文窗口和安全余量配置无效。")
+        if (
+            self.max_output_tokens + self.context_safety_margin_tokens
+            >= self.context_window_tokens
+        ):
+            raise ValueError("模型 Profile 必须保留正的输入上下文预算。")
 
 
 @dataclass(slots=True)
@@ -96,7 +109,10 @@ class LLMConfig:
     timeout_seconds: float = 60.0
     max_retries: int = 1
     max_output_tokens: int = 8192
-    stream: bool = False
+    context_window_tokens: int = 131_072
+    context_safety_margin_tokens: int = 4_096
+    token_estimator: str = "conservative"
+    stream: bool = True
     providers: dict[str, LLMProviderEndpointConfig] = field(default_factory=dict)
     models: dict[str, LLMModelProfileConfig] = field(default_factory=dict)
     routes: LLMRoutesConfig = field(default_factory=LLMRoutesConfig)
@@ -117,6 +133,16 @@ class LLMConfig:
             raise ValueError(f"llm.provider={self.provider!r} 必须配置 api_key。")
         if self.timeout_seconds <= 0 or self.max_retries < 0:
             raise ValueError("LLM 超时必须大于 0，重试次数不能小于 0。")
+        self.token_estimator = self.token_estimator.strip().lower()
+        if self.token_estimator not in {"conservative", "provider"}:
+            raise ValueError("llm.token_estimator 配置无效。")
+        if (
+            self.context_window_tokens <= 0
+            or self.context_safety_margin_tokens < 0
+            or self.max_output_tokens + self.context_safety_margin_tokens
+            >= self.context_window_tokens
+        ):
+            raise ValueError("LLM 必须保留正的输入上下文预算。")
 
     @property
     def uses_profiles(self) -> bool:
@@ -159,13 +185,18 @@ class LLMConfig:
 
 @dataclass(slots=True)
 class AgentConfig:
-    """主 agent 的基础行为配置。"""
+    """主 agent 的基础行为配置。
+
+    ``history_window`` 已移除（§3.5）：Session 不再按消息条数提前裁剪，跨轮上下文
+    改由 trajectory store 的 canonical committed turn 在统一编译器内按 token 预算
+    治理。旧配置仍写 ``[agent].history_window`` 时启动报可操作迁移错误（见
+    ``_build_app_config``）。
+    """
 
     name: str = "Memoli"
     max_iterations: int = 12
     max_elapsed_seconds: float = 300.0
     no_progress_limit: int = 3
-    history_window: int = 20
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -174,6 +205,68 @@ class AgentConfig:
             raise ValueError("agent.max_elapsed_seconds 必须大于 0。")
         if self.no_progress_limit <= 0:
             raise ValueError("agent.no_progress_limit 必须大于 0。")
+
+
+@dataclass(slots=True)
+class ContextManagementConfig:
+    """Provider 前上下文编译、持久化和压缩配置。"""
+
+    enabled: bool = True
+    compaction_enabled: bool = True
+    persistence_enabled: bool = True
+    database: str = "workspace/context-state.db"
+    soft_threshold_ratio: float = 0.75
+    hard_threshold_ratio: float = 0.90
+    recent_tail_tokens: int = 12_000
+    preview_tokens: int = 2_000
+    archive_tokens: int = 4_000
+    # §6.4 有界 archive frontier：聚合注入 token 预算与节点数上限（§8.1 严格校验）。
+    archive_frontier_tokens: int = 16_000
+    archive_frontier_max_items: int = 8
+    # §8.1 跨轮来源单次读取上限：I/O 防护（非语义历史窗口），到达上限时 reader
+    # 返回稳定 continuation/source-truncated 诊断，协调器可分批推进，不得谎称更老
+    # 内容不存在（design line 77/156）。None 表示不限（保守默认，留空即不裁读）。
+    source_read_max_turns: int | None = None
+    source_read_max_bytes: int | None = None
+    # §8.1 单次压缩批次 token 上限：§5.2 批次选择的最旧完整 turn 累计 token 达此
+    # 上限即停止扩充，剩余未覆盖 turn 留待下一轮分批推进（协调器可分批推进）。
+    compaction_batch_tokens: int = 32_000
+    plugin_max_tokens: int = 2_000
+    emergency_retry_limit: int = 1
+    compaction_failure_limit: int = 2
+    compaction_profile: str = ""
+
+    def __post_init__(self) -> None:
+        if not 0 < self.soft_threshold_ratio < self.hard_threshold_ratio < 1:
+            raise ValueError(
+                "context soft threshold 必须小于 hard threshold 且位于 0 到 1。"
+            )
+        if (
+            min(
+                self.recent_tail_tokens,
+                self.preview_tokens,
+                self.archive_tokens,
+                self.archive_frontier_tokens,
+                self.plugin_max_tokens,
+            )
+            <= 0
+        ):
+            raise ValueError("context token 预算必须大于 0。")
+        if self.archive_frontier_max_items <= 0:
+            raise ValueError("context archive_frontier_max_items 必须大于 0。")
+        # §8.1 读取上限为正整数或 None（None=不限，保守默认）；零/负值无意义。
+        if self.source_read_max_turns is not None and self.source_read_max_turns <= 0:
+            raise ValueError("context source_read_max_turns 必须为正整数或留空。")
+        if self.source_read_max_bytes is not None and self.source_read_max_bytes <= 0:
+            raise ValueError("context source_read_max_bytes 必须为正整数或留空。")
+        if self.compaction_batch_tokens <= 0:
+            raise ValueError("context compaction_batch_tokens 必须大于 0。")
+        if self.emergency_retry_limit not in {0, 1}:
+            raise ValueError("context emergency_retry_limit 仅支持 0 或 1。")
+        if self.compaction_failure_limit <= 0:
+            raise ValueError("context compaction_failure_limit 必须大于 0。")
+        if self.persistence_enabled and not self.database.strip():
+            raise ValueError("context persistence 启用时 database 不能为空。")
 
 
 @dataclass(slots=True)
@@ -229,14 +322,24 @@ class MemoryEmbeddingConfig:
 
 @dataclass(slots=True)
 class MemoryHybridConfig:
-    """确定性混合召回参数。"""
+    """MemOS 风格混合召回参数：FTS/Pattern/semantic/metadata 四路通道。"""
 
     enabled: bool = True
     rrf_k: int = 60
+    rrf_bonus_weight: float = 0.4
     candidate_limit: int = 50
-    keyword_weight: float = 1.0
+    fts_candidate_limit: int = 64
+    pattern_candidate_limit: int = 32
+    pattern_term_limit: int = 16
+    fts_weight: float = 1.0
+    pattern_weight: float = 0.4
     semantic_weight: float = 1.0
     metadata_weight: float = 0.5
+    relative_threshold: float = 0.2
+    multi_lane_protection: bool = True
+    smart_seed_ratio: float = 0.7
+    mmr_enabled: bool = True
+    mmr_lambda: float = 0.7
     card_limit: int = 2
     claim_limit: int = 5
     episode_limit: int = 2
@@ -245,12 +348,174 @@ class MemoryHybridConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.rrf_k <= 0 or self.candidate_limit <= 0:
+        if min(self.rrf_k, self.candidate_limit) <= 0:
             raise ValueError("memory.hybrid 的 RRF 和候选上限必须大于 0。")
+        if min(self.fts_candidate_limit, self.pattern_candidate_limit) <= 0:
+            raise ValueError("memory.hybrid 的 FTS/Pattern 候选上限必须大于 0。")
+        if self.pattern_term_limit <= 0:
+            raise ValueError("memory.hybrid.pattern_term_limit 必须大于 0。")
         if min(self.card_limit, self.claim_limit, self.episode_limit) < 0:
             raise ValueError("memory.hybrid 的类型配额不能小于 0。")
+        weights = (
+            self.fts_weight,
+            self.pattern_weight,
+            self.semantic_weight,
+            self.metadata_weight,
+        )
+        if any(w < 0 for w in weights):
+            raise ValueError("memory.hybrid 的 lane 权重必须非负。")
+        if sum(weights) <= 0:
+            raise ValueError("memory.hybrid 至少一个召回 lane 权重必须大于 0。")
+        ratios = (
+            self.rrf_bonus_weight,
+            self.relative_threshold,
+            self.smart_seed_ratio,
+            self.mmr_lambda,
+        )
+        for ratio in ratios:
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError("memory.hybrid 的比例参数必须位于 [0, 1]。")
         if set(self.spillover_order) != {"card", "claim", "episode"}:
             raise ValueError("memory.hybrid.spillover_order 必须包含三种记忆类型。")
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> MemoryHybridConfig:
+        """从 TOML table 构造，对旧 ``keyword_weight`` 返回迁移提示错误。"""
+
+        if "keyword_weight" in raw:
+            raise ValueError(
+                "memory.hybrid.keyword_weight 已移除：严格全文召回改用 "
+                "fts_weight，宽松 Pattern 召回改用 pattern_weight。"
+            )
+        return cls(**raw)
+
+
+@dataclass(slots=True)
+class MemoryExtractorConfig:
+    """离线 Candidate Extractor 的独立配置。"""
+
+    provider: str = "disabled"
+    model: str = ""
+    version: str = "1"
+    schema_version: str = "1"
+    prompt_version: str = "1"
+    policy_version: str = "1"
+    segmenter_version: str = "1"
+    base_url: str = "https://api.openai.com/v1"
+    api_key_env: str = "MEMOLI_MEMORY_EXTRACTOR_API_KEY"
+    timeout_seconds: float = 60.0
+    prompt_max_sensitivity: str = "private"
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"disabled", "deterministic", "openai-compatible"}:
+            raise ValueError("memory.offline.extractor.provider 配置无效。")
+        if self.timeout_seconds <= 0:
+            raise ValueError("memory.offline.extractor.timeout_seconds 必须大于 0。")
+        if self.prompt_max_sensitivity not in {"public", "private", "sensitive"}:
+            raise ValueError(
+                "memory.offline.extractor.prompt_max_sensitivity 配置无效。"
+            )
+
+
+@dataclass(slots=True)
+class MemoryGovernanceConfig:
+    """独立记忆治理 SubAgent 和确定性 Policy Gate 配置。"""
+
+    enabled: bool = True
+    profile: str = "memory-governor"
+    policy_version: str = "1"
+    prompt_version: str = "1"
+    batch_size: int = 8
+    lease_seconds: int = 120
+    max_attempts: int = 5
+    min_independent_evidence: int = 2
+    auto_approve_explicit_low_risk: bool = True
+    auto_approve_implicit_low_risk: bool = True
+    low_risk_fact_types: list[str] = field(
+        default_factory=lambda: ["preference", "profile", "project", "goal"]
+    )
+
+    def __post_init__(self) -> None:
+        if min(self.batch_size, self.lease_seconds, self.max_attempts) <= 0:
+            raise ValueError("memory.offline.governance 的批量、租约和重试必须大于 0。")
+        if self.min_independent_evidence < 1:
+            raise ValueError(
+                "memory.offline.governance.min_independent_evidence 必须大于 0。"
+            )
+        if not self.profile.strip() or not self.policy_version.strip():
+            raise ValueError(
+                "memory.offline.governance 必须配置 profile 和 policy_version。"
+            )
+
+
+@dataclass(slots=True)
+class MemoryOfflineConfig:
+    """持久离线学习 Worker 配置。"""
+
+    poll_seconds: float = 2.0
+    batch_size: int = 4
+    lease_seconds: int = 120
+    max_attempts: int = 5
+    retry_max_seconds: int = 300
+    auto_scan_enabled: bool = False
+    chat_turn_threshold: int = 20
+    long_task_min_business_tool_calls: int = 10
+    long_task_min_distinct_business_tools: int = 2
+    long_task_min_elapsed_seconds: int = 60
+    dead_letter_stale_after_seconds: int = 86_400
+    extractor: MemoryExtractorConfig = field(default_factory=MemoryExtractorConfig)
+    governance: MemoryGovernanceConfig = field(default_factory=MemoryGovernanceConfig)
+
+    def __post_init__(self) -> None:
+        if (
+            self.poll_seconds <= 0
+            or min(
+                self.batch_size,
+                self.lease_seconds,
+                self.max_attempts,
+                self.retry_max_seconds,
+                self.chat_turn_threshold,
+                self.long_task_min_business_tool_calls,
+                self.long_task_min_distinct_business_tools,
+                self.long_task_min_elapsed_seconds,
+                self.dead_letter_stale_after_seconds,
+            )
+            <= 0
+        ):
+            raise ValueError("memory.offline 的轮询、批量、租约和重试必须大于 0。")
+
+
+@dataclass(slots=True)
+class MemoryRetrievalConfig:
+    """Card-first 分层召回合同。"""
+
+    mode: str = "auto"
+    detail_level: str = "summary"
+    card_statement_limit: int = 6
+    claim_expansion_limit: int = 6
+    evidence_expansion_limit: int = 3
+    direct_claim_fallback: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mode not in {
+            "auto",
+            "card-first",
+            "claim-first",
+            "episode-first",
+            "hybrid",
+        }:
+            raise ValueError("memory.retrieval.mode 配置无效。")
+        if self.detail_level not in {"summary", "fact", "evidence"}:
+            raise ValueError("memory.retrieval.detail_level 配置无效。")
+        if (
+            min(
+                self.card_statement_limit,
+                self.claim_expansion_limit,
+                self.evidence_expansion_limit,
+            )
+            < 0
+        ):
+            raise ValueError("memory.retrieval 的分层预算不能小于 0。")
 
 
 @dataclass(slots=True)
@@ -274,6 +539,8 @@ class MemoryConfig:
     maintenance_batch_size: int = 4
     embedding: MemoryEmbeddingConfig = field(default_factory=MemoryEmbeddingConfig)
     hybrid: MemoryHybridConfig = field(default_factory=MemoryHybridConfig)
+    offline: MemoryOfflineConfig = field(default_factory=MemoryOfflineConfig)
+    retrieval: MemoryRetrievalConfig = field(default_factory=MemoryRetrievalConfig)
 
     def __post_init__(self) -> None:
         if self.engine not in {"sqlite", "markdown"}:
@@ -395,6 +662,22 @@ class CLIChannelConfig:
     """CLI 通道配置。"""
 
     enabled: bool = True
+    interactive: bool = True
+    color: str = "auto"
+    refresh_hz: int = 12
+    queue_limit: int = 8
+    max_tool_rows: int = 6
+
+    def __post_init__(self) -> None:
+        self.color = self.color.strip().lower()
+        if self.color not in {"auto", "always", "never"}:
+            raise ValueError("channels.cli.color 必须是 auto、always 或 never。")
+        if not 1 <= self.refresh_hz <= 60:
+            raise ValueError("channels.cli.refresh_hz 必须在 1 到 60 之间。")
+        if not 1 <= self.queue_limit <= 100:
+            raise ValueError("channels.cli.queue_limit 必须在 1 到 100 之间。")
+        if not 1 <= self.max_tool_rows <= 20:
+            raise ValueError("channels.cli.max_tool_rows 必须在 1 到 20 之间。")
 
 
 @dataclass(slots=True)
@@ -550,6 +833,7 @@ class AppConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    context: ContextManagementConfig = field(default_factory=ContextManagementConfig)
     trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     working_memory: WorkingMemoryConfig = field(default_factory=WorkingMemoryConfig)
@@ -587,8 +871,23 @@ def _build_app_config(raw_config: dict[str, Any]) -> AppConfig:
     memory_raw = dict(_table(raw_config, "memory"))
     embedding_raw = memory_raw.pop("embedding", {})
     hybrid_raw = memory_raw.pop("hybrid", {})
-    if not isinstance(embedding_raw, dict) or not isinstance(hybrid_raw, dict):
-        raise TypeError("memory.embedding 和 memory.hybrid 必须是 TOML table。")
+    offline_raw = memory_raw.pop("offline", {})
+    retrieval_raw = memory_raw.pop("retrieval", {})
+    if not all(
+        isinstance(item, dict)
+        for item in (embedding_raw, hybrid_raw, offline_raw, retrieval_raw)
+    ):
+        raise TypeError(
+            "memory.embedding、memory.hybrid、memory.offline 和 memory.retrieval "
+            "必须是 TOML table。"
+        )
+    offline_values = dict(offline_raw)
+    extractor_raw = offline_values.pop("extractor", {})
+    governance_raw = offline_values.pop("governance", {})
+    if not isinstance(extractor_raw, dict) or not isinstance(governance_raw, dict):
+        raise TypeError(
+            "memory.offline.extractor 和 memory.offline.governance 必须是 TOML table。"
+        )
     # 旧配置没有 engine 字段时继续使用 Markdown；新示例显式选择 SQLite。
     if memory_raw and "engine" not in memory_raw:
         memory_raw["engine"] = "markdown"
@@ -610,15 +909,25 @@ def _build_app_config(raw_config: dict[str, Any]) -> AppConfig:
         sandbox=PluginSandboxConfig(**sandbox_raw),
     )
 
+    agent_raw = _table(raw_config, "agent")
+    _reject_legacy_agent_fields(agent_raw)
+
     return AppConfig(
         runtime=RuntimeConfig(**_table(raw_config, "runtime")),
         llm=llm,
-        agent=AgentConfig(**_table(raw_config, "agent")),
+        agent=AgentConfig(**agent_raw),
+        context=ContextManagementConfig(**_table(raw_config, "context")),
         trajectory=TrajectoryConfig(**_table(raw_config, "trajectory")),
         memory=MemoryConfig(
             **memory_raw,
             embedding=MemoryEmbeddingConfig(**embedding_raw),
-            hybrid=MemoryHybridConfig(**hybrid_raw),
+            hybrid=MemoryHybridConfig.from_raw(hybrid_raw),
+            offline=MemoryOfflineConfig(
+                **offline_values,
+                extractor=MemoryExtractorConfig(**extractor_raw),
+                governance=MemoryGovernanceConfig(**governance_raw),
+            ),
+            retrieval=MemoryRetrievalConfig(**retrieval_raw),
         ),
         working_memory=WorkingMemoryConfig(**_table(raw_config, "working_memory")),
         tools=ToolsConfig(**_table(raw_config, "tools")),
@@ -714,6 +1023,34 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"配置项 {key!r} 必须是 TOML 表。")
     return value
+
+
+_LEGACY_AGENT_HISTORY_WINDOW_MESSAGE = (
+    "配置项 [agent].history_window 已移除（§3.5）：Session 不再按消息条数提前裁剪，\n"
+    "跨轮上下文改由 canonical committed turn 在统一编译器内按 token 预算治理。\n"
+    "请删除该字段，改用 [context] 的预算控制近期可见上下文规模：\n"
+    "  - [context].recent_tail_tokens      近期完整 turn 的 token 上限\n"
+    "  - [context].archive_tokens          单份 archive 的 token 上限\n"
+    "  - [context].source_read_max_turns   跨轮来源一次读取的 turn 上限（§8.1）\n"
+    "  - [context].source_read_max_bytes   跨轮来源一次读取的字节上限（§8.1）\n"
+    "  - [context].archive_frontier_tokens 有界活动 frontier 的 token 上限（§8.1）\n"
+    "  - [context].archive_frontier_max_items frontier 节点数上限（§8.1）\n"
+    "迁移示例：删除 `history_window = 20`，按需在 [context] 调整上述预算；\n"
+    "缺少新字段时使用保守默认值，不得静默按消息条数继续裁剪。"
+)
+
+
+def _reject_legacy_agent_fields(agent_raw: dict[str, Any]) -> None:
+    """对已移除的 [agent] 字段返回可操作迁移错误（§3.5）。
+
+    旧 ``history_window`` 若被静默忽略，会令 Session 退回按消息条数裁剪的旧行为，
+    因此必须在启动前显式报错，并指向 ``[context]`` 的 source read、recent tail 与
+    archive frontier 配置。
+    """
+
+    if "history_window" in agent_raw:
+        raise ValueError(_LEGACY_AGENT_HISTORY_WINDOW_MESSAGE)
+
 
 
 def _validate_skill_path(value: str, field_name: str) -> None:

@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from memoli_agent.agent.memory.hybrid import (
+    FtsSearchLane,
     HybridMemoryRetriever,
-    KeywordSearchLane,
     MetadataSearchLane,
+    PatternSearchLane,
     SemanticSearchLane,
 )
 from memoli_agent.agent.memory.models import EvidenceRef, MemoryMutation, MemoryQuery
@@ -99,9 +100,10 @@ async def run_semantic_scale_benchmark(
     worker = MemoryIndexWorker(store, embedder, batch_size=64)
     retriever = HybridMemoryRetriever(
         store,
-        KeywordSearchLane(store),
-        MetadataSearchLane(store),
-        SemanticSearchLane(store, embedder, candidate_limit=max(sizes)),
+        fts_lane=FtsSearchLane(store),
+        pattern_lane=PatternSearchLane(store),
+        metadata_lane=MetadataSearchLane(store),
+        semantic_lane=SemanticSearchLane(store, embedder, candidate_limit=max(sizes)),
         candidate_limit=max(sizes),
     )
     samples: list[SemanticScaleSample] = []

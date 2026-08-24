@@ -10,7 +10,7 @@ base_url = "https://api.deepseek.com"
 [agent]
 name = "Memoli"
 max_iterations = 8
-history_window = 20
+# history_window 已移除：跨轮上下文改由 [context] 的 token 预算治理（§3.5）。
 
 [memory]
 enabled = true

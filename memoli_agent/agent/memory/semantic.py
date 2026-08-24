@@ -8,8 +8,9 @@ import json
 import math
 import os
 import struct
+import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -21,6 +22,10 @@ class EmbeddingError(RuntimeError):
 
 class EmbeddingDisabledError(EmbeddingError):
     """部署未启用语义模型。"""
+
+
+class EmbeddingPermanentError(EmbeddingError):
+    """A configuration, authorization, schema, or vector error."""
 
 
 class Embedder(Protocol):
@@ -155,6 +160,7 @@ class IndexTickResult:
     succeeded: int = 0
     failed: int = 0
     stale: int = 0
+    policy_filtered: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,37 +168,82 @@ class MemoryIndexWorker:
     store: Any
     embedder: Embedder
     batch_size: int = 8
+    worker_id: str = field(default_factory=lambda: f"index-worker-{uuid.uuid4().hex}")
 
     async def tick(self) -> IndexTickResult:
         if not self.embedder.enabled:
             return IndexTickResult()
-        jobs = self.store.claim_index_jobs(self.batch_size)
-        succeeded = failed = stale = 0
-        for job in jobs:
-            source = self.store.get_index_source(job.memory_type, job.memory_id)
-            if source is None or source.content_hash != job.content_hash:
+        jobs = self.store.claim_index_jobs(self.batch_size, worker_id=self.worker_id)
+        succeeded = failed = stale = policy_filtered = 0
+        eligible: list[tuple[Any, Any]] = []
+        for claimed_job in jobs:
+            claimed_source = self.store.get_index_source(
+                claimed_job.memory_type, claimed_job.memory_id
+            )
+            if (
+                claimed_source is None
+                or claimed_source.content_hash != claimed_job.content_hash
+            ):
                 self.store.discard_index_job(
-                    job.memory_type, job.memory_id, job.content_hash
+                    claimed_job.memory_type,
+                    claimed_job.memory_id,
+                    claimed_job.content_hash,
                 )
                 stale += 1
                 continue
-            try:
-                vectors = await self.embedder.embed((source.content,))
-                vector = vectors[0]
-                self.store.complete_index_job(
-                    job,
-                    model=self.embedder.model,
-                    version=self.embedder.version,
-                    dimensions=self.embedder.dimensions,
-                    vector_blob=encode_vector(vector, self.embedder.dimensions),
+            if not claimed_source.embedding_allowed:
+                self.store.discard_index_job(
+                    claimed_job.memory_type,
+                    claimed_job.memory_id,
+                    claimed_job.content_hash,
                 )
-                succeeded += 1
+                policy_filtered += 1
+                continue
+            eligible.append((claimed_job, claimed_source))
+        if eligible:
+            try:
+                vectors = await self.embedder.embed(
+                    tuple(source.content for _, source in eligible)
+                )
             except Exception as exc:
-                # 只记录错误类型，避免 provider 响应或密钥进入数据库。
-                self.store.fail_index_job(job, type(exc).__name__)
-                failed += 1
-        return IndexTickResult(len(jobs), succeeded, failed, stale)
-
+                for claimed_job, _ in eligible:
+                    self.store.fail_index_job(
+                        claimed_job,
+                        type(exc).__name__,
+                        permanent=isinstance(exc, EmbeddingPermanentError),
+                    )
+                    failed += 1
+            else:
+                if len(vectors) != len(eligible):
+                    for claimed_job, _ in eligible:
+                        self.store.fail_index_job(
+                            claimed_job,
+                            "EmbeddingPermanentError",
+                            permanent=True,
+                        )
+                        failed += 1
+                    return IndexTickResult(
+                        len(jobs), succeeded, failed, stale, policy_filtered
+                    )
+                for (claimed_job, _), vector in zip(eligible, vectors, strict=True):
+                    try:
+                        validate_vector(vector, self.embedder.dimensions)
+                        vector_blob = encode_vector(vector, self.embedder.dimensions)
+                    except EmbeddingError as exc:
+                        self.store.fail_index_job(
+                            claimed_job, type(exc).__name__, permanent=True
+                        )
+                        failed += 1
+                        continue
+                    self.store.complete_index_job(
+                        claimed_job,
+                        model=self.embedder.model,
+                        version=self.embedder.version,
+                        dimensions=self.embedder.dimensions,
+                        vector_blob=vector_blob,
+                    )
+                    succeeded += 1
+        return IndexTickResult(len(jobs), succeeded, failed, stale, policy_filtered)
     def rebuild(self, memory_type: str | None = None) -> int:
         return self.store.rebuild_index_jobs(memory_type)
 

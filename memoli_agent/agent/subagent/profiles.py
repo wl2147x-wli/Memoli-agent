@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memoli_agent.agent.memory.governance import (
+    MemoryGovernanceService,
+    governance_tools,
+)
 from memoli_agent.agent.plugins.hooks import HookBus
 from memoli_agent.agent.skills.tool import SkillLoadTool
 from memoli_agent.agent.tools.base import Tool, ToolResult
@@ -84,6 +88,25 @@ def default_subagent_profiles() -> dict[str, SubAgentProfile]:
             can_write_files=True,
             can_use_network=True,
         ),
+        SubAgentProfile(
+            name="memory-governor",
+            description=(
+                "Review exactly one bound offline-memory candidate and submit a "
+                "structured decision through the deterministic policy gate."
+            ),
+            allowed_tools=(
+                "governance_candidate_read",
+                "governance_evidence_read",
+                "governance_related_claims",
+                "governance_decide",
+            ),
+            max_iterations=5,
+            max_elapsed_seconds=90.0,
+            can_write_files=False,
+            can_use_network=False,
+            can_delegate=False,
+            max_depth=1,
+        ),
     )
     return {profile.name: profile for profile in profiles}
 
@@ -95,6 +118,7 @@ class ProfileToolRegistryFactory:
     source_registry: ToolRegistry
     workspace: Path
     hook_bus: HookBus | None = None
+    governance_service: MemoryGovernanceService | None = None
     code_timeout_seconds: int = 60
     code_max_output_chars: int = 10_000
     file_read_max_lines: int = 2_000
@@ -105,10 +129,14 @@ class ProfileToolRegistryFactory:
         profile: SubAgentProfile,
         task_dir: Path,
         memory_refs: tuple[str, ...] = (),
+        *,
+        inherit_hook_bus: bool = True,
     ) -> ToolRegistry:
         """装配实际工具；写工具永远重新绑定到 task_dir。"""
 
-        registry = ToolRegistry(hook_bus=self.hook_bus)
+        registry = ToolRegistry(
+            hook_bus=self.hook_bus if inherit_hook_bus else None
+        )
         source = {tool.name: tool for tool in self.source_registry.list_tools()}
         for name in profile.allowed_tools:
             if name == "skill_load":
@@ -139,6 +167,31 @@ class ProfileToolRegistryFactory:
         source: dict[str, Tool],
         memory_refs: tuple[str, ...],
     ) -> Tool | None:
+        if name.startswith("governance_"):
+            delegate = next(
+                (
+                    tool
+                    for tool in (
+                        governance_tools(self.governance_service)
+                        if self.governance_service is not None
+                        else ()
+                    )
+                    if tool.name == name
+                ),
+                None,
+            )
+            binding = next(
+                (
+                    reference.removeprefix("governance-job:")
+                    for reference in memory_refs
+                    if reference.startswith("governance-job:")
+                ),
+                "",
+            )
+            binder = getattr(delegate, "bind", None)
+            return (
+                binder(binding) if delegate is not None and binding and binder else None
+            )
         if name == "file_read":
             return FileReadTool(
                 self.workspace,

@@ -8,7 +8,7 @@ Memoli-agent 是一个面向长期记忆、自我沉淀和可插拔评测的 Age
 
 ```text
 Memoli-agent/
-  main.py                  # CLI 启动入口
+  main.py                  # 兼容启动入口
   memoli_agent/            # Agent 运行时源码
     agent/                 # 推理、会话、工具、记忆及扩展能力
     bootstrap/             # 配置加载和运行时装配
@@ -69,7 +69,63 @@ pip install -e ".[dev]"
 
 ```powershell
 Copy-Item config.example.toml config.toml
-python main.py
+memoli
+```
+
+`memoli` 无参数时启动前台 CLI 对话；`memoli chat` 是等价的显式写法。
+可以用公共参数选择配置、工作目录和本地会话：
+
+```powershell
+memoli --config config.toml --workspace workspace --session local
+memoli chat --config config.toml --session research
+```
+
+交互式 TTY 默认启用逐键编辑、进程内历史、Rich Markdown、模型流式输出、底部
+状态栏和 `/` 命令面板。输入 `/` 后可用方向键选择、Tab 补全、Enter 提交、Esc
+关闭面板；Alt+Enter 或 Esc+Enter 插入换行。Ctrl+C 在任务运行时等价于 `/stop`，
+空闲时清空输入；空缓冲区 Ctrl+D 正常退出。输入仍串行进入 Agent Loop，运行中
+可以继续排队，队列达到配置上限后会拒绝新的普通消息。
+
+本地斜杠命令不会调用模型，也不会写入普通 Session 消息或被动 turn 轨迹：
+
+```text
+/help        查看命令帮助
+/status      查看非敏感 Runtime 配置摘要
+/checkpoint 查看当前会话工作 checkpoint（/working 为别名）
+/trace       查看当前会话最近一个 trace id
+/clear       只清除当前进程内的短期对话
+/stop        只停止当前 turn，不退出 Runtime
+/workspace   查看当前工作目录（首版只读）
+/model       查看 Provider、模型与 streaming 状态（首版只读）
+/tools       查看可用工具（首版只读）
+/memory      查看记忆、Embedding、Consolidation 与 checkpoint 状态
+/skills      查看 Skill catalog 可用状态（不会加载 Skill）
+/exit        退出（/quit 为别名）
+//text       将 /text 作为普通消息发送给模型
+```
+
+stdin/stdout 被管道或重定向、增强终端初始化失败，或设置
+`channels.cli.interactive = false` 时自动使用无 ANSI/动画的 plain CLI。设置
+`NO_COLOR=1` 可关闭颜色。正式 Provider 默认 `llm.stream = true`；需要一次性输出时
+显式设置 `llm.stream = false`。Echo Provider 即使默认配置为 true 也会按能力自动
+使用非流式调用。
+
+plain CLI 不是另一套旧终端实现：interactive 与 plain 共用同一个命令注册表、
+`CLIController`、排队/取消边界和 renderer 状态机。plain adapter 只降级逐键编辑、
+候选面板、颜色与动画，因此管道和 CI 行为不会与交互模式产生两套业务语义。
+
+无需启动 Provider、插件、MCP 或 Agent Loop，即可离线只读查询已保存的工作状态：
+
+```powershell
+memoli checkpoint --config config.toml --session research
+memoli checkpoint --config config.toml --session research --json
+```
+
+离线查询不会创建数据库，也不会恢复或更新 checkpoint。没有记录或功能关闭时
+返回退出码 `3`，存储读取失败返回 `1`。旧入口仍兼容，并委托给同一套 CLI 生命周期：
+
+```powershell
+python main.py --config config.toml --session local
 ```
 
 `config.toml`、`.env`、`workspace/` 和 `logs/` 是本地运行内容，不应提交。

@@ -9,6 +9,12 @@ from typing import Any, cast
 
 import pytest
 
+from memoli_agent.agent.context_management import (
+    ContextArchive,
+    ContextSnapshot,
+    InMemoryContextStateRepository,
+)
+from memoli_agent.agent.plugins.hooks import HookBus
 from memoli_agent.agent.provider import LLMResponse, ToolCall
 from memoli_agent.agent.subagent.context import ContextCompiler, parse_structured_result
 from memoli_agent.agent.subagent.events import SubAgentResult, SubAgentTask
@@ -33,7 +39,10 @@ from memoli_agent.agent.subagent.runtime import SubAgentRuntime, SubAgentRuntime
 from memoli_agent.agent.tools.builtin import SpawnSubAgentTool, TimeTool
 from memoli_agent.agent.tools.execution import ToolExecutionContext, tool_context
 from memoli_agent.agent.tools.registry import ToolRegistry
-from memoli_agent.agent.trajectory import InMemoryTrajectoryStore
+from memoli_agent.agent.trajectory import (
+    InMemoryTrajectoryStore,
+    NullTrajectoryStore,
+)
 from memoli_agent.agent.types import ChatMessage
 from memoli_agent.bus.queue import MessageBus
 
@@ -265,6 +274,148 @@ def test_subagent_runtime_uses_full_tool_loop_and_records_lineage(
     assert root.attributes["attempt_id"] == "attempt-1"
 
 
+def test_memory_governor_uses_null_trajectory_store(tmp_path: Path) -> None:
+    trajectory = InMemoryTrajectoryStore()
+    hook_bus = HookBus(trajectory)
+    tool_factory = ProfileToolRegistryFactory(
+        ToolRegistry(), tmp_path, hook_bus=hook_bus
+    )
+    factory = SubAgentRuntimeFactory(
+        provider=ScriptedProvider([]),
+        fallback_provider=None,
+        tool_registry_factory=tool_factory,
+        trajectory_store=trajectory,
+        hook_bus=hook_bus,
+    )
+
+    profiles = default_subagent_profiles()
+    assert isinstance(
+        factory.trajectory_store_for(profiles["memory-governor"]),
+        NullTrajectoryStore,
+    )
+    assert factory.trajectory_store_for(profiles["research"]) is trajectory
+    assert factory.hook_bus_for(profiles["memory-governor"]) is None
+    assert factory.hook_bus_for(profiles["research"]) is hook_bus
+    governor_registry = tool_factory.build(
+        profiles["memory-governor"], tmp_path, inherit_hook_bus=False
+    )
+    research_registry = tool_factory.build(profiles["research"], tmp_path)
+    assert governor_registry.hook_bus is None
+    assert research_registry.hook_bus is hook_bus
+
+
+def _main_snapshot(session_key: str) -> ContextSnapshot:
+    """§7.6 主 Agent 会话的最小冻结快照（SubAgent 隔离测试的对照基线）。"""
+    return ContextSnapshot(
+        session_key=session_key,
+        session_instance_id="main-instance",
+        layout_version=1,
+        system_prompt="main-system",
+        skill_catalog="main-skills",
+        tool_schemas_json="[]",
+        system_prompt_hash="ms",
+        skill_catalog_hash="mk",
+        tool_schema_hash="mt",
+        stable_prefix_hash="mp",
+        created_at="now",
+    )
+
+
+def _main_archive(session_key: str) -> ContextArchive:
+    """§7.6 主 Agent 会话的活动 frontier archive（隔离测试对照）。"""
+    return ContextArchive(
+        archive_id="main-arc",
+        session_key=session_key,
+        generation=1,
+        content="main summary",
+        content_hash="main-chash",
+        source_refs=("source:main-1",),
+        epoch=0,
+        status="active",
+    )
+
+
+def test_subagent_does_not_read_or_modify_main_agent_context_state(
+    tmp_path: Path,
+) -> None:
+    """§7.6/§7.5：普通 SubAgent 未装配 durable ContextSource，不读不改主 Agent
+    的 conversation epoch、snapshot 或 archive frontier。
+
+    SubAgentRuntimeFactory 不接受 context_repository（无 snapshot/frontier 句柄），
+    且 SubAgent 全部 trajectory 写入在 ``subagent:`` 命名空间下；主 Agent 会话的
+    epoch/snapshot/frontier 在 SubAgent 运行前后保持不变（design line 58/107）。
+    """
+    trajectory = InMemoryTrajectoryStore()
+    # 主 Agent 会话 "c:1" 的派生状态：epoch=2、冻结快照、活动 frontier
+    main_session = "c:1"
+    assert trajectory.advance_epoch(main_session) == 2
+    repo = InMemoryContextStateRepository()
+    repo.save_snapshot(_main_snapshot(main_session))
+    repo.append_archive(_main_archive(main_session))
+    snapshot_before = repo.get_snapshot(main_session)
+    frontier_before = repo.list_frontier(main_session)
+    epoch_before = asyncio.run(trajectory.current_epoch(main_session))
+
+    # 普通 SubAgent（research）共享 trajectory store；factory 不装配
+    # context_source/context_repository（默认隔离，§7.5）
+    source = ToolRegistry()
+    source.register(TimeTool())
+    profiles = default_subagent_profiles()
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "conclusion": "done",
+                        "evidence": [],
+                        "artifacts": [],
+                    }
+                ),
+                provider="scripted",
+            )
+        ]
+    )
+    runtime = SubAgentRuntime(
+        SubAgentRuntimeFactory(
+            provider=provider,
+            fallback_provider=None,
+            tool_registry_factory=ProfileToolRegistryFactory(source, tmp_path),
+            trajectory_store=trajectory,
+        ),
+        profiles,
+    )
+    task_dir = tmp_path / "task-iso"
+    task_dir.mkdir()
+    task = SubAgentTask(
+        task_id="task-iso",
+        instruction="summarize",
+        profile_name="research",
+        parent_session_key=main_session,
+        task_dir=task_dir,
+        agent_id="agent-iso",
+        parent_agent_id="main",
+        attempt_id="attempt-iso",
+        trace_id="trace-iso",
+    )
+    result = asyncio.run(runtime.run(task))
+    assert result.success
+
+    # 主 Agent 会话派生状态未被 SubAgent 触及（隔离）
+    assert asyncio.run(trajectory.current_epoch(main_session)) == epoch_before
+    assert repo.get_snapshot(main_session) == snapshot_before
+    assert repo.list_frontier(main_session) == frontier_before
+    # SubAgent 在自己的 ``subagent:`` 命名空间写轨迹，未污染主会话
+    subagent_session = f"subagent:{task.agent_id}"
+    trace = trajectory.traces.get(task.trace_id)
+    assert trace is not None
+    assert trace.session_id == subagent_session
+    assert not any(
+        trace.session_id == main_session for trace in trajectory.traces.values()
+    )
+
+
+
 async def _case_spawn_tool_compatibility_and_boundaries(tmp_path: Path) -> None:
     disabled = await SpawnSubAgentTool(None).run({"instruction": "x"})
     assert not disabled.success
@@ -312,9 +463,7 @@ async def _case_manager_sync_background_exports_artifacts_and_session_isolation(
     assert "done:sync" in (persisted.task_dir / "result.md").read_text("utf-8")
     assert manager.get_task(result.task_id, "session-b") is None
 
-    background_id = manager.spawn_background(
-        "background", "research", "session-a"
-    )
+    background_id = manager.spawn_background("background", "research", "session-a")
     event = await asyncio.wait_for(manager.bus.consume_inbound(), timeout=2)
     assert event.metadata["task_id"] == background_id
     assert event.metadata["agent_id"]
@@ -369,10 +518,23 @@ async def _case_manager_dependency_depth_capacity_cancel_and_recovery(
     manager.repository.recover_interrupted()
     with pytest.raises(ValueError, match="显式确认"):
         manager.resume_task("risky", root_session_key="session-a")
-    assert manager.resume_task(
-        "risky", root_session_key="session-a", confirm_side_effects=True
-    ).status is TaskStatus.RUNNABLE
-    await asyncio.sleep(0.2)
+    assert (
+        manager.resume_task(
+            "risky", root_session_key="session-a", confirm_side_effects=True
+        ).status
+        is TaskStatus.RUNNABLE
+    )
+    for _ in range(40):
+        orphan_poll = manager.get_task("orphan", "session-a")
+        risky_poll = manager.get_task("risky", "session-a")
+        if (
+            orphan_poll is not None
+            and orphan_poll.status is TaskStatus.COMPLETED
+            and risky_poll is not None
+            and risky_poll.status is TaskStatus.COMPLETED
+        ):
+            break
+        await asyncio.sleep(0.05)
     orphan_done = manager.get_task("orphan", "session-a")
     risky_done = manager.get_task("risky", "session-a")
     assert orphan_done is not None and orphan_done.status is TaskStatus.COMPLETED
@@ -386,9 +548,7 @@ def test_manager_sync_background_exports_artifacts_and_session_isolation(
     tmp_path: Path,
 ) -> None:
     asyncio.run(
-        _case_manager_sync_background_exports_artifacts_and_session_isolation(
-            tmp_path
-        )
+        _case_manager_sync_background_exports_artifacts_and_session_isolation(tmp_path)
     )
 
 
