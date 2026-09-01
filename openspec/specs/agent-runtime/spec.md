@@ -4,6 +4,7 @@
 
 定义 Memoli 从配置加载、组件装配、消息接入、会话管理到模型推理和生成回复的核心运行行为，以及远程模型失败和应用关闭时必须保持的边界。
 ## Requirements
+
 ### Requirement: Default-startable configuration
 
 系统 SHALL 从 TOML 加载运行配置，并在配置文件缺失时使用内置默认值启动。
@@ -64,25 +65,37 @@
 
 ### Requirement: Session-aware passive turns
 
-系统 SHALL 按消息的 session key 维护近期完整 turn、不可变上下文归档和有限兼容窗口，并通过统一生命周期生成出站消息；进程或显式 Session 恢复能力仅在相应持久上下文状态可靠可用时成立。
+系统 SHALL 按 session key 与持久 conversation epoch 维护跨轮上下文边界，从唯一 canonical turn source 读取近期完整 turn 与 archive frontier，并通过统一生命周期生成出站消息；Session SHALL 只维护身份和瞬态控制状态，不得再以独立消息条数窗口提前删除压缩来源。
 
 #### Scenario: User sends a CLI message
 
 - **WHEN** 通道发布一条普通入站消息
-- **THEN** 系统 SHALL 依次准备会话、查询动态上下文、编译有预算的 prompt、执行推理、保存历史并构造出站消息
+- **THEN** 系统 SHALL 依次解析当前 epoch、读取 committed turns、查询动态上下文、规划并编译 prompt、执行推理、提交 canonical turn 并构造出站消息
 
-#### Scenario: Conversation continues
+#### Scenario: Conversation continues after restart
 
-- **GIVEN** 同一 session key 已有近期历史或不可变 archive
-- **WHEN** 新消息到达
-- **THEN** prompt SHALL 包含受 token 预算约束的相关归档和近期完整 turn
-- **AND** `history_window` SHALL 仅作为兼容或安全上限而不得拆散工具关联或任意半轮消息
+- **GIVEN** 当前 epoch 存在可读取 canonical turns 或 archive frontier
+- **WHEN** Runtime 重启后同一 session key 收到新消息
+- **THEN** prompt SHALL 包含受 token 预算约束的当前 frontier 与近期完整 turn
+- **AND** SHALL 保持 tool correlation、最终用户可见输出和稳定顺序
 
-#### Scenario: Runtime restarts without context persistence
+#### Scenario: User clears visible conversation context
 
-- **WHEN** Runtime 未启用或无法可靠读取 Session context persistence
-- **THEN** 系统 SHALL 创建新的进程内 Session 上下文
-- **AND** SHALL NOT 声称已恢复仅存在于旧进程内存的对话历史
+- **WHEN** 用户在没有活动 turn 时执行 `/clear`
+- **THEN** Runtime SHALL 持久创建新的 conversation epoch 并重置其派生 context snapshot/frontier/preview 可见状态
+- **AND** 旧轨迹、payload、长期记忆和 working-state SHALL 按各自策略保留但不得重新注入新 epoch
+
+#### Scenario: Clear cannot persist its boundary
+
+- **WHEN** epoch store 不可用或新 epoch 无法原子提交
+- **THEN** `/clear` SHALL 报告失败并保持原 epoch 有效
+- **AND** SHALL NOT 只清除内存状态后声称对话已清理
+
+#### Scenario: Runtime has no durable context source
+
+- **WHEN** Runtime 未启用或无法可靠读取持久 canonical turn 内容
+- **THEN** 系统 SHALL 使用新的进程内完整 turn source 并显式标记不可跨重启恢复
+- **AND** SHALL NOT 同时拼接旧 Session history、损坏轨迹或 metadata-only 内容
 
 ### Requirement: Runtime lifecycle
 
@@ -320,31 +333,37 @@
 
 ### Requirement: Unified dynamic context assembly
 
-Runtime SHALL 在每次 Provider 调用前通过统一、缓存感知且有全局预算的编译边界生成模型可见上下文：稳定基础规则和当前 Session 冻结的 Skill/tool 前缀之后依次纳入不可变任务归档、近期完整交互，再在动态尾部纳入个人记忆、插件扩展和唯一最新工作状态；动态内容或 active 指针 SHALL NOT 重写稳定前缀。
+Runtime SHALL 在每次 Provider 调用前通过统一、缓存感知且有全局预算的 Context Plan 生成模型可见上下文；稳定基础规则和当前 epoch 冻结的 Skill/tool 前缀之后依次纳入有界 archive frontier、近期完整交互，再在动态尾部纳入个人记忆、插件扩展和唯一最新工作状态，且所有动态材料 SHALL 使用结构化来源与低权限信任边界。
 
 #### Scenario: Initial model decision is prepared
 
 - **WHEN** Runtime 为新的用户 turn 准备首次模型调用
-- **THEN** 模型可见上下文 SHALL 包含当前用户输入、可用的冻结 Skill catalog、核心/自动召回记忆和当前工作状态
-- **AND** Skill catalog、插件段、记忆、archive 和工作状态 SHALL 使用可区分于终端用户指令和静态安全规则的边界
+- **THEN** 模型可见上下文 SHALL 包含当前用户输入、可用的冻结 Skill catalog、预算允许的核心/自动召回记忆和当前工作状态
+- **AND** Skill catalog、插件、记忆、archive、工具证据和工作状态 SHALL 具有独立类型、来源、优先级与信任元数据
 
 #### Scenario: A later tool-loop decision is prepared
 
 - **WHEN** Skill 或通用工具结果已经提交且 Runtime 准备同一 turn 的后续模型调用
-- **THEN** 模型可见上下文 SHALL 包含完整关联的工具调用/结果和其后的唯一最新工作状态
+- **THEN** 模型可见上下文 SHALL 包含完整关联的工具调用/冻结结果和其后的唯一最新工作状态
 - **AND** SHALL NOT 注入过期状态、重新渲染已冻结前缀或拆散工具协议消息
 
 #### Scenario: No Skill is available
 
-- **WHEN** Skill Runtime 关闭、降级或当前 Session 没有可见 Skill
-- **THEN** Runtime SHALL 在不伪造空 Skill 指令的情况下编译现有交互、历史归档、记忆和工作状态
+- **WHEN** Skill Runtime 关闭、降级或当前 epoch 没有可见 Skill
+- **THEN** Runtime SHALL 在不伪造空 Skill 指令的情况下编译现有交互、frontier、记忆和工作状态
 - **AND** 普通 Agent Loop SHALL 保持可用
 
-#### Scenario: Context compiler is disabled for compatibility
+#### Scenario: Context compaction is disabled
 
-- **WHEN** 配置显式关闭压缩但仍启用统一编译诊断
-- **THEN** Runtime SHALL 保持标准消息角色和现有 Agent Loop 行为
-- **AND** 仍 SHALL 在超出模型硬输入预算前返回明确错误而不是发送已知无效请求
+- **WHEN** 配置关闭语义压缩但仍启用统一编译与硬预算保护
+- **THEN** Runtime SHALL 保持标准消息角色并只执行确定性预览、去噪和有诊断的候选选择
+- **AND** 仍 SHALL 在超出硬输入预算前返回明确错误而不是发送已知无效请求
+
+#### Scenario: SubAgent runs without durable cross-turn context
+
+- **WHEN** memory-governor 或普通 SubAgent profile 未显式装配 durable Context Source
+- **THEN** 其 Reasoner SHALL 使用隔离的本次任务上下文
+- **AND** SHALL NOT 读取或修改主 Agent 的 conversation epoch、snapshot 或 archive frontier
 
 ### Requirement: Dynamic context trust separation
 
@@ -374,19 +393,25 @@ Runtime SHALL 在模型全局输入预算内对核心卡片、自动召回记忆
 
 ### Requirement: Context configuration compatibility
 
-系统 SHALL 为模型窗口、输出预留、安全余量、压缩阈值、近期 tail、archive/preview 预算和压缩失败上限提供可校验配置，并在旧配置缺少新字段时使用保守默认值。
+系统 SHALL 为模型窗口、输出预留、安全余量、soft/hard 阈值、近期 tail、source reader turn/byte 上限、压缩 batch、archive frontier 总预算/节点数、preview 预算和失败上限提供可校验配置；缺少新的 `[context]` 字段时 SHALL 使用保守默认值，但已移除的 `[agent].history_window` SHALL 产生可操作迁移错误。
 
-#### Scenario: Legacy configuration is loaded
+#### Scenario: Configuration omits new context fields
 
-- **WHEN** 配置包含现有 Agent/Memory/Working State/Skill 字段但没有 context management 字段
-- **THEN** Runtime SHALL 使用保守内置 context window 和默认压缩参数启动
-- **AND** SHALL 保留现有 `history_window` 和组件字符上限的兼容语义
+- **WHEN** 配置具有 `[context]` 或完全使用内置默认值但缺少新增 frontier/source/batch 字段
+- **THEN** Runtime SHALL 使用保守默认值启动并在诊断中展示有效预算
+- **AND** SHALL 保留 Memory、Working State 和 Skill 的组件候选上限作为局部保护
 
-#### Scenario: Context thresholds are invalid
+#### Scenario: Legacy history_window is present
 
-- **WHEN** 输出预留、安全余量或阈值导致可用输入预算非正，或 soft threshold 不低于 hard threshold
-- **THEN** 系统 SHALL 在发出模型请求前报告配置错误
-- **AND** SHALL NOT 静默禁用预算保护
+- **WHEN** 配置仍包含 `[agent].history_window`
+- **THEN** Runtime SHALL 在启动前返回说明该字段已移除的配置错误
+- **AND** 错误 SHALL 指向 `[context]` 的 source read、recent tail 与 archive frontier 配置，不得静默忽略或继续按消息条数裁剪
+
+#### Scenario: Context budgets are invalid
+
+- **WHEN** 可用输入预算非正、soft threshold 不低于 hard threshold，或任何 turn/byte/token/item 上限非正或互相矛盾
+- **THEN** 系统 SHALL 在发出模型请求或迁移数据库前报告配置错误
+- **AND** SHALL NOT 静默禁用预算保护或语义压缩
 
 ### Requirement: Memory-context failure isolation
 
@@ -527,3 +552,141 @@ AgentLoop SHALL 维护可寻址的当前 turn 取消边界，使通道可以取�
 - **WHEN** 当前 turn 被取消且队列中已有下一条消息
 - **THEN** AgentLoop SHALL 在取消清理完成后处理下一条消息
 - **AND** 下一条 Outbound SHALL 使用自己的 trace 和输入关联
+
+### Requirement: Isolated offline-memory worker lifecycle
+
+Runtime SHALL 在个人记忆和 consolidation 显式启用且配置有效时，将离线记忆 Worker 作为独立、有序启动和停止的后台生命周期组件；在线 Agent Turn、出站回复和下一条消息处理 SHALL NOT 等待远程提取、Card 投影或 Embedding 完成。
+
+#### Scenario: Runtime starts with offline learning enabled
+
+- **WHEN** memory、consolidation 和有效 Extractor 配置均已启用
+- **THEN** Runtime SHALL 在权威存储可用后启动离线 Worker、恢复过期租约并开始有界消费持久请求
+- **AND** Worker 状态 SHALL 可通过安全诊断查看
+
+#### Scenario: Configuration enables consolidation without an extractor
+
+- **WHEN** consolidation 被启用但 Extractor disabled、缺少必需模型或凭证配置无效
+- **THEN** Runtime SHALL 在启动阶段返回明确配置错误或按规范定义的显式 disabled 状态
+- **AND** SHALL NOT 静默运行一个永远不消费请求的伪 Worker
+
+#### Scenario: Runtime stops during offline work
+
+- **WHEN** 应用在 Worker 正在处理请求时关闭
+- **THEN** Runtime SHALL 停止领取新任务并有界等待当前非网络事务结束
+- **AND** 未完成请求 SHALL 通过租约在后续启动中恢复，而不被标记为成功
+
+### Requirement: Offline-maintenance failure isolation
+
+离线请求、Extractor、Card、Episode 或 Semantic Index 维护失败 SHALL 保持在其持久 Job/Run 状态中并产生安全诊断，且 SHALL NOT 终止普通 Agent Loop、撤销已发布回复或改变已有正式记忆。
+
+#### Scenario: Extractor provider times out
+
+- **WHEN** 离线 Extractor 超时或暂时不可用
+- **THEN** 当前请求 SHALL 进入有界 retry 并释放在线运行资源
+- **AND** 同期和后续普通用户 turn SHALL 继续处理
+
+#### Scenario: Derived index permanently fails
+
+- **WHEN** 派生维护达到最大尝试次数
+- **THEN** Job SHALL 进入 dead-letter 并出现在安全诊断中
+- **AND** 权威 Claim、CardVersion、Trajectory 和非语义召回 SHALL 保持可用
+
+### Requirement: Isolated governance SubAgent lifecycle
+
+Runtime SHALL 将持久 governance job 作为 `memory.db` 中的权威审核队列，按租约调用最小权限 `memory-governor` SubAgent Profile，并 SHALL 将 SubAgent task ID 仅作为执行记录关联回来；SubAgent 推理、重试和用户升级 SHALL NOT 阻塞在线 Agent Turn。
+
+#### Scenario: Candidate creates a governance job
+
+- **WHEN** consolidation 事务成功提交一个新的 Candidate
+- **THEN** 同一 memory 事务 SHALL 幂等登记绑定 candidate ID/revision 和 governor/policy 版本的 pending governance job
+- **AND** 治理调度器 SHALL 在有界资源内领取并调用 SubAgent Runtime，而不依赖下一轮用户消息
+
+#### Scenario: Governance SubAgent profile is started
+
+- **WHEN** 治理调度器执行已领取的 job
+- **THEN** Runtime SHALL 使用不可写文件、不可联网、不可委派且仅含治理专用工具的 `memory-governor` Profile
+- **AND** SHALL 对迭代次数、耗时、上下文、工具调用、批次和并发设置独立上限
+
+#### Scenario: Governance task crashes or times out
+
+- **WHEN** SubAgent 在提交有效决定前崩溃、超时或 Runtime 重启
+- **THEN** governance job SHALL 按租约恢复为 retry 并保持 Candidate 为 candidate
+- **AND** 达到最大尝试次数后 SHALL 进入 dead-letter 或 needs-user-review，而不得自动批准
+
+#### Scenario: User changes a candidate during governance
+
+- **WHEN** Governance SubAgent 读取 Candidate 后用户完成了批准、拒绝或修正
+- **THEN** Runtime/Policy Gate SHALL 通过 expected revision 将旧决定标记 stale/no-op
+- **AND** SHALL NOT 覆盖用户状态或重复登记 Card/索引投影
+
+### Requirement: Idle backlog draining
+
+启用的离线 Worker SHALL 在没有新用户 turn 时按配置轮询或唤醒机制继续有界排空 pending/retry 请求，并 SHALL 遵守批次、并发、超时和资源上限。
+
+#### Scenario: User stops sending messages with pending jobs
+
+- **WHEN** 出站回复后仍有超过单批上限的离线提取或治理积压且没有新的入站消息
+- **THEN** Worker/治理调度器 SHALL 继续按配置处理后续批次直至队列为空、暂停或达到资源边界
+- **AND** SHALL NOT 依赖下一轮用户消息触发每个批次
+
+#### Scenario: Online turn arrives during background work
+
+- **WHEN** Worker 正在等待远程 Provider且新的用户消息到达
+- **THEN** Agent Loop SHALL 能独立开始处理该 turn
+- **AND** Worker SHALL 遵守配置并发和资源配额而不占用在线 turn 的必需事务锁
+
+### Requirement: Durable memory-trigger classification at committed turn boundaries
+
+Runtime SHALL 只从已提交的主用户会话 trace 识别闲聊回合和多工具长期任务完成边界，并 SHALL 把稳定 trace ID、终态和成功工具调用摘要交给离线记忆触发调度器；分类和入队不得阻塞在线回复。
+
+#### Scenario: Completed chat turn is observed
+
+- **WHEN** `cli:` 用户回合已写入 `trace_finished` 且不满足多工具长期任务条件
+- **THEN** Runtime SHALL 将该 trace 作为一个可计数闲聊回合交给触发调度器
+- **AND** SHALL NOT 在该单个回合结束时直接运行 Extractor
+
+#### Scenario: Completed multi-tool task is observed
+
+- **WHEN** `cli:` 用户回合完成至少 10 个具有不同 tool call ID 的成功非内部业务工具调用，并且至少涉及两个不同业务工具种类或 trace 已持续至少 60 秒，随后以 completed 终态提交
+- **THEN** Runtime SHALL 将其分类为 long-task 并在 trace 提交后通知触发调度器
+- **AND** 工具 delta、未正式执行的调用、失败调用重试和内部记忆/治理/工作状态工具 SHALL NOT 增加有效业务工具计数
+
+#### Scenario: A short multi-tool turn is not a long task
+
+- **WHEN** completed `cli:` 回合只有少于 10 个成功非内部业务工具调用，即使其中包含多个业务工具种类
+- **THEN** Runtime SHALL NOT 将该 trace 分类为 long-task
+- **AND** 该 trace SHALL 作为普通未消费闲聊回合参与 20 轮窗口累计
+
+#### Scenario: Ten trivial calls lack a long-task qualifier
+
+- **WHEN** completed `cli:` 回合恰有 10 个成功业务工具调用，但只有一种业务工具且 trace 持续时间少于 60 秒
+- **THEN** Runtime SHALL NOT 将该 trace 分类为 long-task
+- **AND** SHALL NOT 使用模型文本或 Working Checkpoint 猜测来绕过工具种类/持续时间条件
+
+#### Scenario: Turn does not reach a successful terminal state
+
+- **WHEN** 回合 failed、cancelled、needs-user、预算耗尽或进程在 trace 提交前中断
+- **THEN** Runtime SHALL NOT 产生 long-task 提取触发
+- **AND** 后续恢复 SHALL 只处理具有权威完成终态的 trace
+
+### Requirement: Fully isolated memory-governor execution resources
+
+Runtime SHALL 为 `memory-governor` 同时选择一致的非持久 Trajectory、Reasoner Hook 和 ToolRegistry Hook 边界；治理内部执行 SHALL NOT 通过共享插件 HookBus 间接写入主 Agent trajectory，治理决定的权威审计 SHALL 保存在 `memory.db`。
+
+#### Scenario: Governance tool is executed
+
+- **WHEN** `memory-governor` 调用绑定 Candidate 的读取或决定工具
+- **THEN** Reasoner 和 ToolRegistry SHALL 使用一致的 profile-scoped 非持久轨迹/Hook 边界，无论实现采用直接 profile 条件选择还是轻量资源对象
+- **AND** 工具 SHALL 正常返回而不因主轨迹缺少 SubAgent trace row 触发 IntegrityError
+
+#### Scenario: Governance task completes
+
+- **WHEN** Policy Gate 接受、拒绝、升级或推迟一个治理决定
+- **THEN** governance Job、Decision、actor、revision、reason codes 和 task ID SHALL 由 `memory.db`/任务图记录
+- **AND** `trajectories.db` SHALL NOT 包含该 `memory-governor` 的 trace、span、模型或插件 Hook 事件
+
+#### Scenario: Ordinary SubAgent runs
+
+- **WHEN** research、coding 或 general SubAgent 执行普通委派任务
+- **THEN** 其既有轨迹与插件策略行为 SHALL 保持不变
+- **AND** memory-governor 的隔离配置 SHALL NOT 全局关闭主 Agent 或普通 SubAgent Hook

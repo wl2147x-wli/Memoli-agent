@@ -4,6 +4,7 @@
 
 定义模型发现工具 schema、按统一协议调用工具并安全接收结果的行为，同时约束工具失败、推理往返次数、基础工具能力和 workspace 文件访问边界。
 ## Requirements
+
 ### Requirement: Unified tool registration and execution
 
 系统 SHALL 通过统一注册表向模型暴露当前启用工具的确定性 schema snapshot、按名称串行执行工具，并将成功、失败或控制信号表示为关联原始 tool call id 的工具结果；同一 Session 的普通运行 SHALL NOT 因注册发现顺序或使用频率改变工具 schema 顺序。
@@ -51,7 +52,7 @@
 
 ### Requirement: Built-in utility tools
 
-系统 SHALL 保持 `code_run`、`file_read`、`file_patch`、`file_write`、`update_working_checkpoint`、`ask_user`、`start_long_term_update`、`time` 和 `memory_recall` 九个 GenericAgent 风格默认工具；当 Skill Runtime 启用时 SHALL 额外注册只读 `skill_load` 作为第十个内置工具，并 SHALL NOT 默认同时暴露被替代、Skill 管理或需要显式启用的其他工具。
+系统 SHALL 保持 `code_run`、`file_read`、`file_patch`、`file_write`、`update_working_checkpoint`、`ask_user`、`start_long_term_update`、`time` 和 `memory_recall` 九个 GenericAgent 风格默认工具；当 Skill Runtime 启用时 SHALL 额外注册只读 `skill_load` 作为第十个内置工具，并 SHALL NOT 提供已被替代的 `calculator`、`memory_write`、`filesystem_read` 或旧版 SubAgent 工具实现。
 
 #### Scenario: Default tool schemas are requested
 
@@ -74,19 +75,14 @@
 #### Scenario: Optional SubAgent tool is enabled
 
 - **WHEN** SubAgent 工具通过配置显式启用且管理器可用
-- **THEN** `spawn_subagent` SHALL 在当前默认工具之外注册
+- **THEN** 当前持久任务图版本的 `spawn_subagent` SHALL 在默认工具之外注册
+- **AND** SHALL NOT 注册或回退到旧版 SubAgent 委派实现
 
-#### Scenario: Calculator evaluates allowed syntax
+#### Scenario: Removed legacy tool is requested
 
-- **GIVEN** 兼容用 `calculator` 被显式注册，而不是作为默认工具暴露
-- **WHEN** 输入只包含数值、括号以及受支持的算术运算符
-- **THEN** `calculator` SHALL 返回计算结果
-
-#### Scenario: Calculator receives unsupported syntax
-
-- **GIVEN** 兼容用 `calculator` 被显式注册，而不是作为默认工具暴露
-- **WHEN** 表达式包含函数调用、变量或不受支持的 AST 节点
-- **THEN** `calculator` SHALL 拒绝计算并返回失败结果
+- **WHEN** 模型或调用方请求 `calculator`、`memory_write` 或 `filesystem_read`
+- **THEN** 当前工具注册表 SHALL 将其作为不存在的工具返回结构化失败
+- **AND** Runtime SHALL NOT 提供兼容实现或隐式改写为替代工具
 
 ### Requirement: Workspace read confinement
 
@@ -210,13 +206,49 @@
 
 ### Requirement: Deferred long-term update request
 
-`start_long_term_update` SHALL 只创建可追踪的待处理长期整理请求，不在当前工具调用中执行记忆、Prompt、Skill、程序或模型参数更新。
+`start_long_term_update` SHALL 只持久化当前会话的长期整理意图并唤醒触发调度器，不得在当前工具调用中运行记忆整理，也不得绕过“20 个完成闲聊回合”或“成功完成多工具长期任务”的自动触发边界。
+
+#### Scenario: Long-term update is requested before a trigger boundary
+
+- **WHEN** 普通 Agent 在同一会话不足 20 个未消费闲聊回合且当前 trace 尚未满足长期任务完成条件时调用 `start_long_term_update`
+- **THEN** 工具 SHALL 返回稳定 hint/request identity 和 waiting-for-trigger 状态
+- **AND** SHALL NOT 立即运行 Extractor、创建 Candidate 或声称记忆已经更新
+
+#### Scenario: Trigger boundary becomes eligible
+
+- **WHEN** 已记录整理意图的会话随后达到 20 个完成闲聊回合，或当前多工具长期任务成功提交 trace 终态
+- **THEN** 触发调度器 SHALL 幂等创建对应的持久 consolidation request 并唤醒 Worker
+- **AND** 当前用户回复 SHALL NOT 等待 Candidate、Governor、Card 或索引完成
+
+#### Scenario: Repeated update hints are submitted
+
+- **WHEN** 同一 session 和未消费边界内重复调用 `start_long_term_update`
+- **THEN** 系统 SHALL 合并为同一个持久整理意图
+- **AND** SHALL NOT 重置闲聊计数、重复绑定 trace 或创建并行提取请求
+
+#### Scenario: Offline consolidation is disabled
+
+- **WHEN** consolidation 关闭时调用 `start_long_term_update`
+- **THEN** 工具 SHALL 返回明确 disabled 状态和原因
+- **AND** SHALL NOT 保存一个永远无法满足的伪运行请求
 
 #### Scenario: Long-term update is requested
 
 - **WHEN** 模型调用 `start_long_term_update`
-- **THEN** 系统 SHALL 返回包含稳定请求标识和 `pending` 状态的结果
-- **AND** SHALL 将该请求关联到当前 trace
+- **THEN** 系统 SHALL 持久化并返回包含稳定请求标识、关联 trace、scope 和 `pending` 状态的结果
+- **AND** 重复的同一工具调用 SHALL 返回同一请求身份而不创建重复请求
+
+#### Scenario: Runtime restarts after request creation
+
+- **WHEN** 请求已提交但 Runtime 在 Worker 消费前重启
+- **THEN** 请求 SHALL 继续可查询并在离线能力启用时恢复处理
+- **AND** SHALL NOT 退化为仅存在进程内存的状态
+
+#### Scenario: Request is accepted
+
+- **WHEN** 持久请求创建成功
+- **THEN** 当前工具调用 SHALL 在不等待 Extractor、Candidate、Card 或 Embedding 的情况下返回
+- **AND** SHALL NOT 自动修改 Prompt、Skill、工具实现、训练数据或模型参数
 
 #### Scenario: Request is recorded but not consumed
 
@@ -247,19 +279,25 @@
 
 ### Requirement: Faithful raw tool trajectory
 
-启用轨迹记录时，系统 SHALL 保存足以按顺序还原模型所见内容、模型工具意图、实际工具执行和模型所收结果的客观事实；大型结果 SHALL 同时保留原始脱敏 payload 与实际模型可见的冻结预览/引用，并 SHALL 将评价与训练派生数据排除在原始事件之外。
+启用轨迹记录时，系统 SHALL 保存足以按顺序还原模型所见内容、模型工具意图、实际工具执行和模型所收结果的 canonical 客观事实；大型结果 SHALL 同时保留原始脱敏 payload 与绑定 conversation epoch 的冻结预览/引用，并 SHALL 将评价、隐藏 reasoning 与训练派生数据排除在原始事件之外。
 
 #### Scenario: Tool call completes
 
 - **WHEN** 已注册工具成功、失败、超时或产生控制信号
-- **THEN** 原始轨迹 SHALL 保存模型可见 schema、tool call id、工具名、模型原始参数、实际执行参数、开始与结束时序、执行状态和错误
+- **THEN** 原始轨迹 SHALL 保存 epoch、turn/message 序号、模型可见 schema、tool call id、工具名、模型原始参数、实际执行参数、时序、状态和错误
 - **AND** SHALL 保存原始脱敏输出以及实际返回模型的有界输出或稳定受管引用
 
 #### Scenario: Large tool result is previewed
 
 - **WHEN** 工具原始脱敏结果超过模型可见预算
-- **THEN** 轨迹 SHALL 保存原文 payload 引用、内容哈希、原始/可见大小、转换标志和冻结预览
-- **AND** 后续上下文恢复 SHALL 能证明模型所见预览与首次提交版本一致
+- **THEN** 轨迹 SHALL 保存原文 payload 引用、epoch、tool call id、内容哈希、原始/可见大小、转换标志和冻结预览
+- **AND** 后续上下文恢复 SHALL 验证模型所见预览与首次提交版本一致
+
+#### Scenario: Preview validation fails during restoration
+
+- **WHEN** 冻结预览的 epoch、tool call id、内容哈希或 payload reference 与 canonical turn 不一致
+- **THEN** Runtime SHALL 排除整个受影响 turn 或以可观察 tool-protocol 错误结束
+- **AND** SHALL NOT 只注入 tool call、只注入 result 或重新生成不一致预览
 
 #### Scenario: Explicit argument expansion occurs
 
@@ -297,7 +335,7 @@
 
 ### Requirement: Governed personal-memory tools
 
-启用个人记忆时，系统 SHALL 区分只读召回、显式正式写入、Candidate 治理操作与离线整理请求恢复操作，并支持显式记住、纠正、冻结、删除、查看、导出、有条件重试治理任务，以及对 consolidation dead-letter 执行有审计的 retry/suppress；显式正式写入 SHALL 以当前用户逐字依据为权威事实来源。`memory_manage` 工具的模型可见描述与拒绝信息 SHALL 向模型传达两阶段契约，使模型能预见逐字照抄要求并自纠正，而不得放宽判定逻辑。
+启用个人记忆时，系统 SHALL 区分只读召回、显式正式写入、Candidate 治理操作与离线整理请求恢复操作，并支持显式记住、纠正、冻结、删除、查看、导出、有条件重试治理任务，以及对 consolidation dead-letter 执行有审计的 retry/suppress；显式正式写入 SHALL 以当前用户逐字依据为权威事实来源。
 
 #### Scenario: Agent explicitly recalls memory
 
@@ -307,9 +345,15 @@
 
 #### Scenario: User explicitly asks the agent to remember a fact
 
-- **WHEN** 受治理管理工具收到关联当前显式用户消息的 `remember` 操作
-- **THEN** 系统 SHALL 创建可追踪的显式用户 claim 并返回稳定 ID 和状态
-- **AND** SHALL NOT 把 Assistant 自己的历史陈述用作用户依据
+- **WHEN** 受治理管理工具收到关联当前显式用户消息的 `remember` 操作及逐字 `basis_quote`
+- **THEN** 系统 SHALL 从该 quote 确定性移除记忆指令包装并保存原子权威事实、verified Evidence、稳定用户消息身份、事实类型、敏感度和允许的结构槽位
+- **AND** 模型提供的规范化 content 与 basis 不一致或不能由其确定性支持时 SHALL 拒绝写入，而不得借合法 quote 保存无关事实
+
+#### Scenario: User explicitly corrects a fact
+
+- **WHEN** `correct` 操作提供当前用户逐字依据、目标 Claim ID 和 expected revision
+- **THEN** 系统 SHALL 使用同一显式证据合同创建修正事实并原子保存 corrects/supersedes 关系
+- **AND** 旧事实、Evidence 和修订历史 SHALL 保持可审计
 
 #### Scenario: Agent attempts an unsupported implicit write
 
@@ -317,17 +361,71 @@
 - **THEN** 管理工具 SHALL 拒绝正式写入或仅创建明确标记的 candidate
 - **AND** SHALL 返回拒绝或候选原因
 
-#### Scenario: User corrects or freezes a memory
+#### Scenario: User retries a governance job
 
-- **WHEN** 管理工具收到关联显式用户消息的 `correct` 或 `freeze` 操作及目标 ID
-- **THEN** 系统 SHALL 创建修正版本或更新冻结状态并返回实际受影响 ID
-- **AND** 原始 claim、来源和修订历史 SHALL 保持可审计
+- **WHEN** 有权用户或操作者请求重试当前 scope 内仍绑定未变化 Candidate 的 dead-letter governance job
+- **THEN** 工具 SHALL 通过治理服务执行条件状态迁移并返回实际 Job ID、旧状态、新状态和 revision
+- **AND** SHALL NOT 直接执行 SQL、清除历史审计或重试 stale Job
+
+#### Scenario: Operator retries a consolidation dead-letter
+
+- **WHEN** 有权操作者对当前 scope 内尚未提交 Candidate 的 quarantined consolidation request 执行 `request_retry`
+- **THEN** 管理工具 SHALL 通过记忆服务将同一稳定 request 和 trace binding 恢复为 retry 并唤醒 Worker
+- **AND** SHALL NOT 创建新的 request ID、清除历史错误审计或释放 trace 给其他触发 lane
+
+#### Scenario: Operator cancels a consolidation dead-letter
+
+- **WHEN** 有权操作者对当前 scope 内尚未提交 Candidate 的 quarantined consolidation request 执行 `request_cancel`
+- **THEN** 管理工具 SHALL 将 request 和 consumption 转为 suppressed，并返回实际 request ID 与前后状态
+- **AND** SHALL NOT 暴露 force-release、自动重放 suppressed trace 或取消已提交 Candidate 的请求
+
+#### Scenario: User freezes or forgets a memory
+
+- **WHEN** 管理工具收到当前用户对允许 scope 内目标 ID 的 `freeze` 或 `forget` 操作
+- **THEN** 系统 SHALL 更新合法生命周期并返回实际受影响 ID
+- **AND** 原始 Claim、来源和修订历史 SHALL 保持可审计
 
 #### Scenario: Memory subsystem is disabled
 
 - **WHEN** 任一个人记忆工具在 memory 关闭时被调用
 - **THEN** 工具 SHALL 返回结构化 disabled 结果
 - **AND** SHALL NOT 创建 memory database 写入
+
+#### Scenario: Agent requests summary-level recall
+
+- **WHEN** `memory_recall` 使用 `detail_level=summary` 或省略细节层级且 auto 路由命中稳定 Card statement
+- **THEN** 工具 SHALL 优先返回有界 Card statement 摘要而不默认展开全部 Claim/Evidence
+- **AND** SHALL 返回可供后续 fact/evidence 展开的 statement 和 Claim refs
+
+#### Scenario: Agent requests fact or evidence expansion
+
+- **WHEN** `memory_recall` 使用 `detail_level=fact|evidence` 并引用已命中的 Card/statement 或提供精确、高风险查询
+- **THEN** 工具 SHALL 通过受管关系有界展开当前 Claim，并仅在 evidence 层返回 scope-safe Evidence 摘要/引用
+- **AND** 工具 SHALL 重新执行 scope、敏感度、生命周期和字符预算，不得返回越权原文
+
+#### Scenario: Caller selects a retrieval route
+
+- **WHEN** 调用者选择 auto、card-first、claim-first、episode-first 或 hybrid
+- **THEN** 工具 SHALL 使用请求路由或返回明确的安全降级/不支持结果，并在响应中报告实际执行路由
+- **AND** card-first SHALL 保留规范定义的 Claim 回退，episode-first SHALL NOT 把事件直接提升为正式 Claim
+
+#### Scenario: User lists offline candidates
+
+- **WHEN** 有权用户请求查看其 scope 内待审 Candidate
+- **THEN** 工具 SHALL 返回有界 Candidate ID、结构化内容、状态、来源摘要、Evidence reference、冲突诊断和提取版本
+- **AND** SHALL 过滤其他 scope 或超过调用者敏感权限的正文
+
+#### Scenario: User approves or rejects a candidate
+
+- **WHEN** 管理工具收到有权用户或人工主体对目标 Candidate 的 `approve` 或 `reject` 操作
+- **THEN** 系统 SHALL 执行合法状态转移并返回实际影响 ID、前后状态和修订
+- **AND** Extractor、自动 Worker 或普通 Assistant 身份 SHALL NOT 自行批准其提取结果；Governance SubAgent 只能通过专用受限决定合同请求 Policy Gate 执行转换
+
+#### Scenario: User corrects or freezes a memory
+
+- **WHEN** 管理工具收到关联显式用户消息的 `correct` 或 `freeze` 操作及目标 ID
+- **THEN** 系统 SHALL 创建修正版本或更新冻结状态并返回实际受影响 ID
+- **AND** 原始 claim、来源和修订历史 SHALL 保持可审计
 
 #### Scenario: Tool description states the two-phase write contract
 
@@ -406,3 +504,63 @@
 - **WHEN** 模型加载 Skill 后需要执行其步骤
 - **THEN** 模型 SHALL 使用当前已授权的通用、浏览器、MCP 或 SubAgent 工具完成动作
 - **AND** `skill_load` SHALL 只返回说明内容而不产生业务副作用
+
+### Requirement: Least-privilege governance SubAgent tools
+
+系统 SHALL 为 `memory-governor` Profile 提供专用、最小权限的 Candidate 读取、Evidence 读取、同 scope 相关记忆读取和结构化决定工具；这些工具 SHALL NOT 允许任意 Claim 状态写入、跨 scope 查询、文件/网络/代码能力或再次委派。
+
+#### Scenario: Governance SubAgent reviews a candidate
+
+- **WHEN** Runtime 以 `memory-governor` Profile 启动治理任务
+- **THEN** SubAgent SHALL 只能读取任务绑定的 Candidate、已验证 Evidence 和允许 scope 内的相关 Claim
+- **AND** 提交决定 SHALL 包含 candidate ID、expected revision、固定 decision 枚举、reason codes、置信度和 governor/prompt/policy 版本
+
+#### Scenario: Governance SubAgent attempts an arbitrary status update
+
+- **WHEN** SubAgent 请求未绑定 Candidate、任意目标状态、跨 scope 目标或通用 `memory_manage` 写操作
+- **THEN** 工具层 SHALL 拒绝调用并记录不含敏感正文的 denied 审计
+- **AND** Claim、governance job 和派生投影 SHALL 保持不变
+
+#### Scenario: Policy Gate applies a governance decision
+
+- **WHEN** 专用决定工具收到格式有效的 approve、reject、needs-user-review 或 defer 决定
+- **THEN** Policy Gate SHALL 按证据、风险、冲突、frozen、策略版本和 expected revision 校验允许的实际转换
+- **AND** 工具 SHALL 返回决定 ID、前后状态、实际影响 ID及 approved/rejected/escalated/stale/denied 结果
+
+### Requirement: CLI candidate review experience
+
+交互式 CLI SHALL 在不阻塞普通输入和回复渲染的前提下显示当前用户 scope 内 `needs-user-review` 的有界数量，并 SHALL 提供候选列表、详情、批准和拒绝入口；CLI SHALL 复用治理服务/工具合同而不得直接读写 SQLite。
+
+#### Scenario: CLI shows pending user reviews
+
+- **WHEN** 当前 scope 存在一个或多个 `needs-user-review` governance job
+- **THEN** CLI 状态区或记忆状态视图 SHALL 显示待用户审核数量
+- **AND** `/memory candidates` 或等价命令 SHALL 返回有界列表，包括 Candidate ID、事实摘要、风险/冲突原因和审核状态
+
+#### Scenario: User inspects and approves a candidate in CLI
+
+- **WHEN** 用户通过 CLI 打开 Candidate 详情并确认 approve
+- **THEN** CLI SHALL 展示 scope-safe Evidence 摘要和自动治理理由，并通过同一治理服务提交带 actor/revision 的用户决定
+- **AND** 成功结果 SHALL 显示实际前后状态，stale/forbidden 结果 SHALL 不伪装成批准成功
+
+#### Scenario: CLI remains usable while governance runs
+
+- **WHEN** Governance SubAgent 正在审核或治理队列暂时不可用
+- **THEN** CLI SHALL 继续接受用户输入并显示 running/retry/unavailable 的安全状态
+- **AND** SHALL NOT 阻塞在线 turn、重复输入框或破坏历史会话渲染
+
+### Requirement: Offline-memory request diagnostics
+
+系统 SHALL 提供只读、scope-safe 的长期整理请求状态查询，至少区分 pending、running、retry、completed、failed/dead-letter 和 cancelled，并报告有界尝试、时间、版本与错误分类而不暴露敏感正文、凭证或向量。
+
+#### Scenario: User checks a request
+
+- **WHEN** 调用者查询其有权访问的长期整理 request ID
+- **THEN** 工具 SHALL 返回当前状态、关联 trace、候选数量、尝试次数、版本和安全错误分类
+- **AND** 查询 SHALL NOT 触发新的提取或状态修改
+
+#### Scenario: Caller checks another scope
+
+- **WHEN** 调用者查询不属于其 scope 或无权限访问的 request ID
+- **THEN** 系统 SHALL 返回 not-found/forbidden 的安全结果
+- **AND** SHALL NOT 泄露请求是否存在、来源正文或 Candidate 内容

@@ -15,13 +15,14 @@ from memoli_agent.agent.context_management.models import (
     ContextSnapshot,
     FrozenToolPreview,
     OutboxEvent,
+    ToolDisclosure,
 )
 
 # §6.1：v2 增加 archives 的 epoch/level/status/coverage_hash/parent_archive_refs
 # 列与 coverage/outbox 表；旧 v1 DB 经 _migrate_v1_to_v2 additive 升级，不删数据。
 # §7.1：v3 把 snapshots 主键迁移到 (session_key, conversation_epoch)。
 # §7.4：v4 给 previews 加 visible 列（派生索引 epoch 清理/不可见状态）。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ContextStateError(RuntimeError):
@@ -40,6 +41,12 @@ class ContextStateRepository(Protocol):
     def invalidate_snapshot(
         self, session_key: str, reason: str, epoch: int = 0
     ) -> None: ...
+
+    def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure: ...
+
+    def list_tool_disclosures(
+        self, session_key: str, epoch: int
+    ) -> tuple[ToolDisclosure, ...]: ...
 
     def list_archives(self, session_key: str) -> tuple[ContextArchive, ...]: ...
 
@@ -146,6 +153,7 @@ class InMemoryContextStateRepository:
         # §6.1 outbox 行（结构对等；投递由 §6.6 实现）。
         self.outbox: dict[str, list[dict[str, object]]] = {}
         self.previews: dict[str, FrozenToolPreview] = {}
+        self.tool_disclosures: dict[tuple[str, int], list[ToolDisclosure]] = {}
         # §7.4 不可见预览派生索引：epoch 清理时把旧 epoch 预览标记不可见（不删，
         # 保留审计/可重建），get_preview_by_ref 据此过滤，不注入新 epoch 上下文。
         self.invisible_previews: set[str] = set()
@@ -179,6 +187,30 @@ class InMemoryContextStateRepository:
                 self.snapshots[(session_key, epoch)] = replace(
                     current, invalidated_reason=reason[:512]
                 )
+
+    def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure:
+        with self._lock:
+            key = (disclosure.session_key, disclosure.conversation_epoch)
+            items = self.tool_disclosures.setdefault(key, [])
+            existing = next(
+                (item for item in items if item.tool_name == disclosure.tool_name),
+                None,
+            )
+            if existing is not None:
+                if existing.schema_hash != disclosure.schema_hash:
+                    raise ContextStateError(
+                        "disclosed tool schema changed within epoch"
+                    )
+                return existing
+            committed = replace(disclosure, sequence=len(items) + 1)
+            items.append(committed)
+            return committed
+
+    def list_tool_disclosures(
+        self, session_key: str, epoch: int
+    ) -> tuple[ToolDisclosure, ...]:
+        with self._lock:
+            return tuple(self.tool_disclosures.get((session_key, epoch), ()))
 
     def list_archives(self, session_key: str) -> tuple[ContextArchive, ...]:
         with self._lock:
@@ -515,6 +547,11 @@ class InMemoryContextStateRepository:
             self.outbox.pop(session_key, None)
             self.failures.pop(session_key, None)
             self.diagnostics.pop(session_key, None)
+            self.tool_disclosures = {
+                key: value
+                for key, value in self.tool_disclosures.items()
+                if key[0] != session_key
+            }
             # §7.4 预览派生索引不在此硬删：由 clear_epoch_previews 按 epoch 标记
             # 不可见（保留审计/可重建），原始 payload 由 trajectory 独立保留。
             # 预览行与不可见标记一并保留，不受本会话硬重置影响。
@@ -547,7 +584,7 @@ class SQLiteContextStateRepository:
             current = int(row["version"]) if row is not None else None
             if current is None:
                 # 全新 DB：直接建当前 schema
-                self._create_v4_schema()
+                self._create_v5_schema()
                 self._connection.execute(
                     "INSERT OR IGNORE INTO schema_info VALUES ('context-state', ?)",
                     (SCHEMA_VERSION,),
@@ -559,6 +596,7 @@ class SQLiteContextStateRepository:
                 self._migrate_v2_to_v3()
                 # §7.4 v3→v4 链式：previews 加 visible 列
                 self._migrate_v3_to_v4()
+                self._migrate_v4_to_v5()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -569,6 +607,7 @@ class SQLiteContextStateRepository:
                 self._migrate_v2_to_v3()
                 # §7.4 v3→v4 链式：previews 加 visible 列
                 self._migrate_v3_to_v4()
+                self._migrate_v4_to_v5()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -577,6 +616,14 @@ class SQLiteContextStateRepository:
             elif current == 3:
                 # §7.4 v3→v4：previews 加 visible 列（派生索引 epoch 清理/不可见）
                 self._migrate_v3_to_v4()
+                self._migrate_v4_to_v5()
+                self._connection.execute(
+                    "UPDATE schema_info SET version=? "
+                    "WHERE component='context-state'",
+                    (SCHEMA_VERSION,),
+                )
+            elif current == 4:
+                self._migrate_v4_to_v5()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -587,7 +634,7 @@ class SQLiteContextStateRepository:
                     f"context-state schema {current} is not supported"
                 )
 
-    def _create_v4_schema(self) -> None:
+    def _create_v5_schema(self) -> None:
         # archives：epoch/level/status/coverage_hash/parent_archive_refs 为真实列
         # （供 list_frontier 索引与 coverage 活动非重叠 partial UNIQUE），data 仍存
         # 完整 ContextArchive JSON（重建权威，列为其查询镜像）。
@@ -620,6 +667,17 @@ class SQLiteContextStateRepository:
                 preview_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
                 data TEXT NOT NULL,
                 visible INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS tool_disclosures (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key TEXT NOT NULL,
+                conversation_epoch INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                schema_hash TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_key, conversation_epoch, tool_name)
             );
             CREATE TABLE IF NOT EXISTS session_state (
                 session_key TEXT PRIMARY KEY, compaction_failures INTEGER NOT NULL,
@@ -766,6 +824,19 @@ class SQLiteContextStateRepository:
             "ALTER TABLE previews ADD COLUMN visible INTEGER NOT NULL DEFAULT 1"
         )
 
+    def _migrate_v4_to_v5(self) -> None:
+        """v4→v5 additive migration: epoch-scoped deferred-tool disclosures."""
+
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS tool_disclosures ("
+            "sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_key TEXT NOT NULL, conversation_epoch INTEGER NOT NULL, "
+            "tool_name TEXT NOT NULL, schema_json TEXT NOT NULL, "
+            "schema_hash TEXT NOT NULL, tool_call_id TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "UNIQUE(session_key, conversation_epoch, tool_name))"
+        )
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
@@ -809,6 +880,58 @@ class SQLiteContextStateRepository:
                 "WHERE session_key=? AND conversation_epoch=?",
                 (_json(asdict(invalidated)), session_key, epoch),
             )
+
+    def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure:
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO tool_disclosures "
+                    "(session_key, conversation_epoch, tool_name, schema_json, "
+                    "schema_hash, tool_call_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        disclosure.session_key,
+                        disclosure.conversation_epoch,
+                        disclosure.tool_name,
+                        disclosure.schema_json,
+                        disclosure.schema_hash,
+                        disclosure.tool_call_id,
+                        disclosure.created_at,
+                    ),
+                )
+                row = self._connection.execute(
+                    "SELECT sequence, session_key, conversation_epoch, tool_name, "
+                    "schema_json, schema_hash, tool_call_id, created_at "
+                    "FROM tool_disclosures WHERE session_key=? "
+                    "AND conversation_epoch=? AND tool_name=?",
+                    (
+                        disclosure.session_key,
+                        disclosure.conversation_epoch,
+                        disclosure.tool_name,
+                    ),
+                ).fetchone()
+                assert row is not None
+                committed = _tool_disclosure_from_row(row)
+                if committed.schema_hash != disclosure.schema_hash:
+                    raise ContextStateError(
+                        "disclosed tool schema changed within epoch"
+                    )
+                return committed
+        except sqlite3.DatabaseError as exc:
+            raise ContextStateError(type(exc).__name__) from exc
+
+    def list_tool_disclosures(
+        self, session_key: str, epoch: int
+    ) -> tuple[ToolDisclosure, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence, session_key, conversation_epoch, tool_name, "
+                "schema_json, schema_hash, tool_call_id, created_at "
+                "FROM tool_disclosures WHERE session_key=? AND conversation_epoch=? "
+                "ORDER BY sequence, tool_name",
+                (session_key, epoch),
+            ).fetchall()
+        return tuple(_tool_disclosure_from_row(row) for row in rows)
 
     def list_archives(self, session_key: str) -> tuple[ContextArchive, ...]:
         with self._lock:
@@ -1166,6 +1289,7 @@ class SQLiteContextStateRepository:
                 "coverage",
                 "outbox",
                 "session_state",
+                "tool_disclosures",
             ):
                 self._connection.execute(
                     f"DELETE FROM {table} WHERE session_key=?", (session_key,)
@@ -1245,6 +1369,19 @@ def _outbox_from_row(row: sqlite3.Row) -> OutboxEvent:
         last_error=row["last_error"],
         created_at=row["created_at"],
         delivered_at=row["delivered_at"],
+    )
+
+
+def _tool_disclosure_from_row(row: sqlite3.Row) -> ToolDisclosure:
+    return ToolDisclosure(
+        session_key=str(row["session_key"]),
+        conversation_epoch=int(row["conversation_epoch"]),
+        tool_name=str(row["tool_name"]),
+        schema_json=str(row["schema_json"]),
+        schema_hash=str(row["schema_hash"]),
+        tool_call_id=str(row["tool_call_id"]),
+        created_at=str(row["created_at"]),
+        sequence=int(row["sequence"]),
     )
 
 

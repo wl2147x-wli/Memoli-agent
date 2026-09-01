@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -15,6 +16,7 @@ from memoli_agent.agent.context_management import (
     InMemoryContextStateRepository,
     OutboxEvent,
     SQLiteContextStateRepository,
+    ToolDisclosure,
 )
 
 
@@ -69,6 +71,32 @@ def _snapshot(session_key: str = "s") -> ContextSnapshot:
     )
 
 
+def test_v4_repository_migrates_tool_disclosure_table(tmp_path: Path) -> None:
+    database = tmp_path / "v4.db"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE schema_info "
+        "(component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+    )
+    connection.execute("INSERT INTO schema_info VALUES ('context-state', 4)")
+    connection.commit()
+    connection.close()
+
+    repo = SQLiteContextStateRepository(database)
+    repo.close()
+
+    connection = sqlite3.connect(database)
+    version = connection.execute(
+        "SELECT version FROM schema_info WHERE component='context-state'"
+    ).fetchone()
+    table = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_disclosures'"
+    ).fetchone()
+    connection.close()
+    assert version == (5,)
+    assert table == ("tool_disclosures",)
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_repository_round_trip(tmp_path: Path, persistent: bool) -> None:
     repo = (
@@ -84,11 +112,24 @@ def test_repository_round_trip(tmp_path: Path, persistent: bool) -> None:
     repo.append_archive(archive)
     repo.append_archive(archive)
     repo.save_preview(preview)
+    disclosure = ToolDisclosure(
+        "s",
+        2,
+        "deferred",
+        "{}",
+        hashlib.sha256(b"{}").hexdigest(),
+        "call-search",
+        "now",
+    )
+    committed_disclosure = repo.save_tool_disclosure(disclosure)
+    assert repo.save_tool_disclosure(disclosure) == committed_disclosure
     repo.set_compaction_failures("s", 2)
     assert repo.get_snapshot("s") == snapshot
     assert repo.list_archives("s") == (archive,)
     assert repo.get_preview("p1") == preview
     assert repo.get_compaction_failures("s") == 2
+    assert repo.list_tool_disclosures("s", 2) == (committed_disclosure,)
+    assert repo.list_tool_disclosures("other", 2) == ()
     repo.close()
 
 

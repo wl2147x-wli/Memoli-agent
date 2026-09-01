@@ -35,6 +35,7 @@ from memoli_agent.agent.context_management.models import (
     FrozenToolPreview,
     LayerBudget,
     OutboxEvent,
+    ToolDisclosure,
     TurnEnvelope,
     normalized_cache_usage,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "TokenEstimator",
     "TaskAwareCompactor",
     "ToolResultPreviewer",
+    "ToolDisclosure",
     "TrajectoryContextSource",
     "ContextStateError",
     "ContextStateRepository",

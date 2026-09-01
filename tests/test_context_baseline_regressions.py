@@ -443,7 +443,7 @@ def test_leading_tool_protocol_is_preserved_by_suffix_selection() -> None:
 
 
 def test_pre_change_context_state_schema_baseline(tmp_path: Path) -> None:
-    """1.5→§6.1→§7.1→§7.4 schema 已 additive 迁移到 v4。
+    """1.5→§6.1→§7.1→§7.4→工具披露账本 schema 已 additive 迁移到 v5。
 
     v1→v2：archives 加 epoch/level/status/coverage_hash/parent_archive_refs 列；新增
     coverage（活动非重叠 partial UNIQUE）与 outbox（幂等投递）表；旧 v1 archive 的
@@ -454,7 +454,7 @@ def test_pre_change_context_state_schema_baseline(tmp_path: Path) -> None:
     v1 schema 作迁移对照，迁移落地后翻转为验证迁移结果。
     """
 
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     db = tmp_path / "context.db"
     _seed_v1_context_db(db)  # 旧 v1 schema + 一条 epoch 仅在 JSON 中的 archive
     repo = SQLiteContextStateRepository(db)
@@ -466,7 +466,7 @@ def test_pre_change_context_state_schema_baseline(tmp_path: Path) -> None:
     }
     assert {
         "schema_info", "snapshots", "archives", "previews",
-        "session_state", "coverage", "outbox",
+        "session_state", "coverage", "outbox", "tool_disclosures",
     } <= tables
     archive_cols = {
         row["name"]

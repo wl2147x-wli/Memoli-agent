@@ -9,6 +9,7 @@ authors = [
 ]
 dependencies = [
   "anthropic>=0.121,<1",
+  "jsonschema>=4.23,<5",
   "mcp>=1.27,<2",
   "openai>=2.44,<3",
   "prompt_toolkit>=3.0.51,<4",

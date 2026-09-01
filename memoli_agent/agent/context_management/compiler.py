@@ -112,15 +112,62 @@ class ContextCompiler:
         snapshot = self._snapshot(
             session_key, epoch, session_instance_id, messages, tools or []
         )
-        self._mark_revoked_tools(snapshot, revoked_tool_names)
+        disclosures = self.repository.list_tool_disclosures(session_key, epoch)
+        disclosed_tools: list[dict[str, Any]] = []
+        disclosed_names: set[str] = set()
+        for disclosure in disclosures:
+            if _hash(disclosure.schema_json) != disclosure.schema_hash:
+                self.repository.invalidate_snapshot(
+                    session_key,
+                    f"tool-disclosure-corrupt:{disclosure.tool_name}",
+                    epoch=epoch,
+                )
+                raise ContextSnapshotInvalidated(
+                    f"tool-disclosure-corrupt:{disclosure.tool_name}"
+                )
+            schema = json.loads(disclosure.schema_json)
+            name = _tool_schema_name(schema)
+            if not name or name != disclosure.tool_name or name in disclosed_names:
+                self.repository.invalidate_snapshot(
+                    session_key,
+                    f"tool-disclosure-invalid:{disclosure.tool_name}",
+                    epoch=epoch,
+                )
+                raise ContextSnapshotInvalidated(
+                    f"tool-disclosure-invalid:{disclosure.tool_name}"
+                )
+            disclosed_names.add(name)
+            disclosed_tools.append(schema)
+        self._mark_revoked_tools(snapshot, revoked_tool_names, disclosed_names)
         snapshot = self.repository.get_snapshot(session_key, epoch) or snapshot
         # §7.2 安全撤销 fail-closed：snapshot 因能力撤销失效时，其冻结 schema 仍
         # 含已撤销能力；编译立即拒绝向模型暴露该能力（不静默替换为其他版本），
         # 仅留 audit 失效原因。恢复需新 epoch 重新冻结当前（不含撤销能力）schema。
         if snapshot.invalidated_reason:
             raise ContextSnapshotInvalidated(snapshot.invalidated_reason)
-        frozen_tools = tuple(json.loads(snapshot.tool_schemas_json))
+        base_tools = list(json.loads(snapshot.tool_schemas_json))
+        base_names = _tool_names(base_tools)
+        if base_names & disclosed_names:
+            raise ContextSnapshotInvalidated("tool-disclosure-overlaps-base")
+        effective_tools = tuple([*base_tools, *disclosed_tools])
+        effective_tools_json = json.dumps(
+            effective_tools,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        effective_tool_hash = _hash(effective_tools_json)
         diagnostics: list[ContextDiagnostic] = []
+        diagnostics.extend(
+            ContextDiagnostic(
+                "tool-disclosed",
+                block_id=item.tool_name,
+                kind="tool-schema",
+                source="tool-search",
+                reason=f"epoch:{epoch}",
+            )
+            for item in disclosures
+        )
         # §4.2 结构化来源分类：仅 system 角色按注入来源分桶；user/tool/assistant
         # 一律进 trajectory，正文 marker 不再重排、改写角色或提升信任。
         plugins, dynamic, trajectory = self._partition(messages[1:], diagnostics)
@@ -163,7 +210,7 @@ class ContextCompiler:
             *all_trajectory,
             *dynamic,
         ]
-        candidate_tokens = self.estimator.count_request(full_candidate, frozen_tools)
+        candidate_tokens = self.estimator.count_request(full_candidate, effective_tools)
         available = (
             self.settings.context_window_tokens
             - self.settings.max_output_tokens
@@ -176,11 +223,11 @@ class ContextCompiler:
             *_required_current_group(trajectory),
             *_minimal_latest_state(dynamic),
         ]
-        if self.estimator.count_request(minimum, frozen_tools) > available:
+        if self.estimator.count_request(minimum, effective_tools) > available:
             raise ContextBudgetExhausted(
                 "minimum required context exceeds model budget"
             )
-        estimated = self.estimator.count_request(candidate, frozen_tools)
+        estimated = self.estimator.count_request(candidate, effective_tools)
         threshold = self.settings.hard_threshold_ratio if emergency else 1.0
         target = max(1, int(available * threshold))
         while estimated > target and len(trajectory) > len(
@@ -194,7 +241,7 @@ class ContextCompiler:
                 *trajectory,
                 *dynamic,
             ]
-            estimated = self.estimator.count_request(candidate, frozen_tools)
+            estimated = self.estimator.count_request(candidate, effective_tools)
             diagnostics.append(
                 ContextDiagnostic(
                     "trimmed",
@@ -219,7 +266,7 @@ class ContextCompiler:
                 *trajectory,
                 *dynamic,
             ]
-            estimated = self.estimator.count_request(candidate, frozen_tools)
+            estimated = self.estimator.count_request(candidate, effective_tools)
         usage_ratio = estimated / max(1, available)
         # §5.1/§5.2 plan 阶段：按降载前候选比率判定 normal/soft/hard/emergency；
         # §5.5 删除同步机械 _archive——compile 不再提交 archive、不再按角色塞 JSON，
@@ -281,7 +328,7 @@ class ContextCompiler:
         )
         compilation = ContextCompilation(
             messages=tuple(candidate),
-            tools=frozen_tools,
+            tools=effective_tools,
             blocks=blocks,
             budget=ContextBudget(
                 self.settings.context_window_tokens,
@@ -297,7 +344,7 @@ class ContextCompiler:
             diagnostics=tuple(diagnostics),
             layout_version=LAYOUT_VERSION,
             stable_prefix_hash=snapshot.stable_prefix_hash,
-            tool_schema_hash=snapshot.tool_schema_hash,
+            tool_schema_hash=effective_tool_hash,
             context_hash=context_hash,
             layers=layers,
             archive_generation=archives[-1].generation if archives else 0,
@@ -313,13 +360,15 @@ class ContextCompiler:
         self,
         snapshot: ContextSnapshot,
         revoked_tool_names: frozenset[str],
+        disclosed_tool_names: set[str] | None = None,
     ) -> None:
         # §7.2 安全撤销 fail-closed：仅显式安全撤销（frozen ∩ revoked）使 snapshot
         # 失效。普通工具集变更（增删/重排）属非安全性变更，不失效、不 fail-closed，
         # 已冻结前缀保持稳定、仅影响后续新 epoch（spec「Runtime state changes
         # during an epoch」「Capability is revoked for safety」）。
         frozen_names = _tool_names(json.loads(snapshot.tool_schemas_json))
-        revoked = sorted(frozen_names & revoked_tool_names)
+        visible_names = frozen_names | (disclosed_tool_names or set())
+        revoked = sorted(visible_names & revoked_tool_names)
         if revoked and not snapshot.invalidated_reason:
             self.repository.invalidate_snapshot(
                 snapshot.session_key,
@@ -970,3 +1019,12 @@ def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
         for item in tools
         if isinstance(item.get("function"), dict)
     } - {""}
+
+
+def _tool_schema_name(schema: object) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    function = schema.get("function")
+    if not isinstance(function, dict):
+        return ""
+    return str(function.get("name") or "")

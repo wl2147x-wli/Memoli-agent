@@ -20,6 +20,8 @@ class ToolExecutionContext:
     user_content: str = ""
     session_instance_id: str = ""
     span_id: str = ""
+    conversation_epoch: int = 0
+    allowed_tool_names: frozenset[str] = frozenset()
 
 
 _CURRENT_CONTEXT: ContextVar[ToolExecutionContext | None] = ContextVar(

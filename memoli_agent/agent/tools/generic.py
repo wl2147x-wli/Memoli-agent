@@ -214,18 +214,20 @@ class CodeRunTool:
     memory_mb: int = 256
     cpus: float = 0.5
     pids_limit: int = 64
+    supported_types: tuple[str, ...] = field(init=False)
     name: str = "code_run"
     description: str = (
         "代码执行器。优先 Python；脚本只在子进程执行，适合计算、搜索和批处理。"
     )
-    parameters: dict[str, Any] = field(
-        default_factory=lambda: {
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
             "type": "object",
             "properties": {
                 "script": {"type": "string", "description": "要执行的代码。"},
                 "type": {
                     "type": "string",
-                    "enum": ["python", "powershell"],
+                    "enum": list(self.supported_types),
                     "default": "python",
                 },
                 "timeout": {
@@ -238,7 +240,6 @@ class CodeRunTool:
             "required": ["script"],
             "additionalProperties": False,
         }
-    )
 
     def __post_init__(self) -> None:
         if self.runner not in {"container", "trusted-host", "disabled"}:
@@ -253,6 +254,12 @@ class CodeRunTool:
                 raise ValueError("trusted-host Python 必须是存在的绝对路径。")
         if self.memory_mb <= 0 or self.cpus <= 0 or self.pids_limit <= 0:
             raise ValueError("code runner 资源限制必须大于 0。")
+        supported = ["python"] if self.runner != "disabled" else []
+        if self.runner == "trusted-host" and (
+            shutil.which("pwsh") or shutil.which("powershell")
+        ):
+            supported.append("powershell")
+        object.__setattr__(self, "supported_types", tuple(supported))
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         script = arguments.get("script")
@@ -261,6 +268,10 @@ class CodeRunTool:
             return _failure(self.name, ValueError("script 必须显式提供。"))
         if self.runner == "disabled":
             return _failure(self.name, PermissionError("代码执行器已禁用。"))
+        if code_type not in self.supported_types:
+            return _failure(
+                self.name, ValueError(f"当前执行 profile 不支持：{code_type}")
+            )
         if not self.allow_network and _looks_like_network_access(script):
             return _failure(
                 self.name, PermissionError("当前执行 profile 禁止网络访问。")

@@ -340,7 +340,14 @@ class Reasoner:
                 working_messages, session_key
             )
             compiled_metadata: dict[str, Any] = {}
-            iteration_tools = list(tools or ())
+            iteration_tools = (
+                self.tool_registry.get_schemas(
+                    session_key=session_key,
+                    conversation_epoch=commit.epoch,
+                )
+                if self.tool_registry is not None and self.context_compiler is None
+                else list(tools or ())
+            )
             # 仅 context_compiler 非空分支才 compile 赋值；reactive 块经同一
             # 守卫到达，调用 _apply_compaction_plan 前用 assert 收窄（pyright
             # 无法跨两个独立 if 关联“context_compiler 非空 ⟹ compilation 已赋值”）。
@@ -790,6 +797,10 @@ class Reasoner:
                         span_id=tool_span_id,
                         user_message_id=user_message_id,
                         user_content=current_user_content,
+                        conversation_epoch=commit.epoch,
+                        allowed_tool_names=frozenset(
+                            _schema_tool_names(iteration_tools)
+                        ),
                     ),
                 )
                 tool_results.append((tool_call, result))
@@ -1676,6 +1687,17 @@ def _progress_fingerprint(results: list[tuple[ToolCall, ToolResult]]) -> str:
         normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _schema_tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for item in tools:
+        function = item.get("function")
+        if isinstance(function, dict):
+            name = str(function.get("name") or "")
+            if name:
+                names.add(name)
+    return names
 
 
 def _message_dicts(messages: list[ChatMessage]) -> list[dict[str, Any]]:

@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
+from memoli_agent.agent.context_management.models import ToolDisclosure
 from memoli_agent.agent.tools.base import Tool, ToolResult
+from memoli_agent.agent.tools.execution import current_tool_context
 from memoli_agent.agent.tools.registry import ToolRegistry
 
 
@@ -39,12 +44,15 @@ class ToolSearchTool:
     registry: ToolRegistry
     limit: int = 8
     name: str = "tool_search"
-    description: str = "Search and disclose deferred plugin or MCP tools by keyword."
+    description: str = "按关键词搜索并披露当前会话尚未加载的插件或 MCP 工具。"
     parameters: dict[str, Any] = field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": "描述当前缺少的能力或工具关键词。",
+                },
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -53,15 +61,58 @@ class ToolSearchTool:
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         query = str(arguments.get("query") or "").strip()
-        selected = self.registry.disclose(query, limit=self.limit)
+        context = current_tool_context()
+        repository = self.registry.disclosure_repository
+        if context is None or not context.session_key or repository is None:
+            return ToolResult(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "ToolDisclosureContextUnavailable",
+                    },
+                    ensure_ascii=False,
+                ),
+                success=False,
+                status="error",
+                metadata={"error": "ToolDisclosureContextUnavailable"},
+            )
+        selected = self.registry.search_deferred(
+            query,
+            limit=self.limit,
+            exclude=context.allowed_tool_names,
+        )
+        disclosed_schemas: list[dict[str, Any]] = []
+        disclosed_names: list[str] = []
+        for tool in selected:
+            schema = self.registry.schema_for(tool)
+            schema_json = json.dumps(
+                schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            disclosure = repository.save_tool_disclosure(
+                ToolDisclosure(
+                    session_key=context.session_key,
+                    conversation_epoch=context.conversation_epoch,
+                    tool_name=tool.name,
+                    schema_json=schema_json,
+                    schema_hash=hashlib.sha256(schema_json.encode()).hexdigest(),
+                    tool_call_id=context.tool_call_id,
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            )
+            disclosed_schemas.append(json.loads(disclosure.schema_json))
+            disclosed_names.append(disclosure.tool_name)
+        payload = {
+            "status": "success",
+            "query": query,
+            "disclosed": disclosed_names,
+            "disclosed_tools": disclosed_schemas,
+        }
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return ToolResult(
-            content=(
-                "disclosed tools: " + ", ".join(tool.name for tool in selected)
-                if selected
-                else "no deferred tools matched"
-            ),
+            content=content,
+            raw_content=content,
             metadata={
                 "query": query,
-                "disclosed": [tool.name for tool in selected],
+                "disclosed": disclosed_names,
             },
         )

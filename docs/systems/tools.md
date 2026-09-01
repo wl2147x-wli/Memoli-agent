@@ -6,7 +6,8 @@ Memoli 默认采用参照 GenericAgent 公开 schema 与行为重写的极简工
 
 ## 默认工具
 
-Skill Runtime 关闭时，默认模型可见集合固定为九个工具：
+Skill Runtime 关闭时，默认模型可见集合由配置和运行环境决定；标准容器配置下为九个
+工具：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -20,24 +21,47 @@ Skill Runtime 关闭时，默认模型可见集合固定为九个工具：
 | `time` | 查询本地和 UTC 时间 |
 | `memory_recall` | 检索已有长期记忆 |
 
-旧工具迁移关系：
+`code_runner = "disabled"` 时不注册 `code_run`。容器 profile 的 `code_run` schema
+只声明 Python；可信宿主 profile 仅在启动时探测到 PowerShell 后才声明 PowerShell，
+因此模型看到的参数枚举与当前实例实际可执行能力一致。
+
+遗留兼容实现已经从源码删除，不再支持手工导入注册；迁移关系如下：
 
 - `filesystem_read` 改用 `file_read`。
 - `calculator` 改用 `code_run` 执行 Python。
-- `memory_write` 不再默认暴露；未经处理的轨迹不能直接成为长期事实。
-- `spawn_subagent` 设置 `tools.subagent_tool_enabled = true` 后才附加注册。
+- `memory_write` 改用受证据约束的 `memory_manage` 或离线长期整理流程；未经处理的
+  轨迹不能直接成为长期事实。benchmark 的同名 ingest mode 是独立导入策略，仍然保留。
+- 旧版 SubAgent 委派实现已删除；`spawn_subagent` 仅指持久任务图版本，并在设置
+  `tools.subagent_tool_enabled = true` 后附加注册。
+
+请求三个已删除工具名时，`ToolRegistry` 会返回结构化“工具不存在”失败，不会自动
+改写为替代工具。历史轨迹和归档文档中的旧名称作为审计记录保留。
 
 工具数量很小时不启用主动发现，`tool_search_enabled` 默认关闭，此时全部启用工具按
 名称稳定排序并进入完整 schema snapshot。启用后，基础工具与 `tool_search` 先组成
 稳定前缀；后续插件、MCP 或其他延迟注册工具由 `tool_search` 返回有界、确定性候选，
-仅选中的完整 schema 会被披露并冻结。引用或发现结果不会扩大原工具权限，安全撤销
-仍然 fail closed。详见 [Context Management](context-management.md)。
+仅选中的完整 schema 会写入 `(session_key, conversation_epoch)` 披露账本。下一次
+Provider 请求由 Context Compiler 在原稳定前缀后按首次披露顺序追加这些 schema；
+其他 Session/Epoch 不会继承。引用或发现结果不会扩大原工具权限，未进入本次有效
+schema 集的延迟工具不能靠猜名称执行，安全撤销仍然 fail closed。详见
+[Context Management](context-management.md)。
 
 启用 `[skills].enabled=true` 且 Skill Registry 装配成功时，额外注册第十个只读
 工具 `skill_load(name, reference?)`。它对应 GenericAgent 的 L1 紧凑目录与 L3
 按需全文注入模式：Catalog 负责选择，Tool Result 负责固定版本说明。它不执行脚本、
 不管理版本，也不扩大其他九个工具的权限。`related_sop` 仍只是 Working State 提示，
 只有成功 `skill_load` 才在轨迹中计为 Skill 使用。
+
+## 参数合同
+
+所有已注册工具的参数 schema 都按 JSON Schema Draft 2020-12 在注册时校验，并在
+执行前统一校验模型原始参数。若安全策略 hook 改写参数，改写后的参数还会再次校验；
+失败统一返回结构化 `ToolArgumentsInvalid`，工具主体不会运行。工具自身的业务约束
+仍保留，但不再承担通用类型、必填字段和未知字段检查。
+
+`memory_recall` 只声明实际进入检索查询的过滤与展开参数。事实写入元数据
+`fact_type`、`subject`、`entity`、`predicate`、`value` 和 `sensitivity` 归属于
+`memory_manage` 的 remember/correct 合同，不再由只读检索工具声明后静默忽略。
 
 ## 文件边界
 

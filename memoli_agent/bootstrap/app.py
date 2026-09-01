@@ -275,6 +275,7 @@ def build_app_runtime(config: AppConfig) -> AppRuntime:
         mcp_names_provider=lambda: (
             set(mcp_manager.clients) if mcp_manager is not None else set()
         ),
+        context_repository=context_repository,
     )
     subagent_manager = build_subagent_manager(
         config,

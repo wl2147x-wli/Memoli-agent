@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+import memoli_agent.agent.tools.builtin as builtin_tools
 from memoli_agent.agent.subagent.manager import SubAgentManager
 from memoli_agent.agent.tools.browser import (
     BrowserAdapter,
@@ -23,6 +24,7 @@ from memoli_agent.agent.tools.generic import (
     FileReadTool,
     FileWriteTool,
 )
+from memoli_agent.agent.tools.registry import ToolRegistry
 from memoli_agent.bootstrap.config import AppConfig, RuntimeConfig, ToolsConfig
 from memoli_agent.bootstrap.tools import build_tool_registry
 
@@ -238,7 +240,23 @@ def test_code_runner_profiles_require_immutable_or_explicit_runtime(
     with pytest.raises(ValueError, match="绝对路径"):
         CodeRunTool(tmp_path, runner="trusted-host", python_executable="python")
     disabled = CodeRunTool(tmp_path, runner="disabled")
+    assert disabled.parameters["properties"]["type"]["enum"] == []
     assert run(disabled.run({"script": "print('no')"})).success is False
+
+
+def test_code_runner_schema_matches_profile_and_disabled_is_not_registered(
+    tmp_path: Path,
+) -> None:
+    container = CodeRunTool(tmp_path)
+    assert container.parameters["properties"]["type"]["enum"] == ["python"]
+
+    registry = build_tool_registry(
+        AppConfig(
+            runtime=RuntimeConfig(workspace=str(tmp_path)),
+            tools=ToolsConfig(code_runner="disabled"),
+        )
+    )
+    assert "code_run" not in {tool.name for tool in registry.list_tools()}
 
 
 @dataclass
@@ -297,6 +315,67 @@ def test_default_registry_is_exact_nine_tools_and_optionals_are_explicit(
 
     unavailable = build_tool_registry(optional_config, working_state=state)
     assert len(unavailable.list_tools()) == 9
+
+
+def test_removed_legacy_tools_have_no_implementation_and_fail_as_missing() -> None:
+    for class_name in (
+        "CalculatorTool",
+        "MemoryWriteTool",
+        "FilesystemReadTool",
+        "LegacySpawnSubAgentTool",
+    ):
+        assert not hasattr(builtin_tools, class_name)
+
+    registry = ToolRegistry()
+    for tool_name in ("calculator", "memory_write", "filesystem_read"):
+        result = run(registry.execute(tool_name, {}))
+        assert result.success is False
+        assert result.metadata == {"tool": tool_name}
+        assert result.content == f"工具不存在：{tool_name}"
+
+
+def test_registry_rejects_schema_invalid_arguments_before_tool_execution(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(FileWriteTool(tmp_path))
+
+    unknown = run(
+        registry.execute(
+            "file_write",
+            {"path": "x.txt", "content": "x", "unexpected": True},
+        )
+    )
+    missing = run(registry.execute("file_write", {"path": "x.txt"}))
+
+    assert unknown.metadata["error"] == "ToolArgumentsInvalid"
+    assert unknown.metadata["validator"] == "additionalProperties"
+    assert missing.metadata["error"] == "ToolArgumentsInvalid"
+    assert missing.metadata["validator"] == "required"
+    assert not (tmp_path / "x.txt").exists()
+
+
+def test_memory_tool_schemas_only_expose_consumed_fields(tmp_path: Path) -> None:
+    registry = build_tool_registry(
+        AppConfig(
+            runtime=RuntimeConfig(workspace=str(tmp_path)),
+            tools=ToolsConfig(memory_manage_enabled=True),
+        )
+    )
+    schemas = {
+        item["function"]["name"]: item["function"]["parameters"]["properties"]
+        for item in registry.get_schemas()
+    }
+    write_metadata = {
+        "fact_type",
+        "subject",
+        "entity",
+        "predicate",
+        "value",
+        "sensitivity",
+    }
+    assert write_metadata.isdisjoint(schemas["memory_recall"])
+    assert write_metadata <= set(schemas["memory_manage"])
 
 
 def test_browser_tools_scan_and_save_long_result_inside_workspace(

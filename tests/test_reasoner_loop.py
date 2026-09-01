@@ -28,6 +28,7 @@ from memoli_agent.agent.provider import (
 )
 from memoli_agent.agent.tools.base import ToolResult
 from memoli_agent.agent.tools.registry import ToolRegistry
+from memoli_agent.agent.tools.tool_search import ToolSearchTool
 from memoli_agent.agent.trajectory import (
     InMemoryTrajectoryStore,
     NewTrajectoryEvent,
@@ -47,6 +48,7 @@ class ScriptedProvider:
     responses: list[LLMResponse]
     name: str = "scripted"
     calls: list[list[ChatMessage]] = field(default_factory=list)
+    tool_schemas: list[list[dict[str, Any]]] = field(default_factory=list)
 
     async def chat(
         self,
@@ -54,6 +56,7 @@ class ScriptedProvider:
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         self.calls.append(list(messages))
+        self.tool_schemas.append(list(tools or ()))
         if not self.responses:
             raise ProviderError("没有更多脚本响应")
         return self.responses.pop(0)
@@ -254,6 +257,52 @@ def test_two_tool_rounds_complete_and_preserve_model_context() -> None:
     assert any(message.content == "second-result" for message in provider.calls[2])
     assert [event.event_type for event in store.events].count("model_requested") == 3
     assert store.events[-1].event_type == "trace_finished"
+
+
+def test_tool_search_disclosure_reaches_next_provider_request() -> None:
+    repository = InMemoryContextStateRepository()
+    registry = ToolRegistry(disclosure_repository=repository)
+    registry.register(ToolSearchTool(registry))
+    registry.enable_progressive_disclosure()
+    weather = RecordingTool("weather_lookup", description="weather lookup")
+    registry.register(weather)
+    provider = ScriptedProvider(
+        [
+            LLMResponse("", [ToolCall("tool_search", {"query": "weather"})]),
+            LLMResponse("", [ToolCall("weather_lookup", {})]),
+            LLMResponse("done"),
+        ]
+    )
+    compiler = ContextCompiler(
+        repository,
+        ConservativeTokenEstimator(),
+        ContextCompilerSettings(32_000, 2_000, 1_000, compaction_enabled=False),
+    )
+    reasoner = Reasoner(
+        provider,
+        tool_registry=registry,
+        trajectory_store=InMemoryTrajectoryStore(),
+        context_compiler=compiler,
+    )
+
+    result = run(
+        reasoner.run_turn(
+            [ChatMessage("system", "system"), ChatMessage("user", "weather")],
+            session_key="search-session",
+            session_instance_id="search-instance",
+        )
+    )
+
+    assert result.termination_reason is TerminationReason.COMPLETED
+    first_names = {
+        item["function"]["name"] for item in provider.tool_schemas[0]
+    }
+    second_names = {
+        item["function"]["name"] for item in provider.tool_schemas[1]
+    }
+    assert first_names == {"tool_search"}
+    assert second_names == {"tool_search", "weather_lookup"}
+    assert weather.calls == [{}]
 
 
 def test_two_tool_rounds_persist_complete_sqlite_hierarchy(tmp_path: Path) -> None:

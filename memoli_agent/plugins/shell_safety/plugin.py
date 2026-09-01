@@ -28,7 +28,6 @@ class ShellSafetyPlugin:
             "file_read",
             "file_write",
             "file_patch",
-            "filesystem_read",
         }
         if event.tool_name not in protected_tools:
             return ToolDecision.allow()

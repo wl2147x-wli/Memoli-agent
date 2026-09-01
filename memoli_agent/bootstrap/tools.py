@@ -9,6 +9,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from memoli_agent.agent.context_management.repository import (
+    ContextStateRepository,
+    InMemoryContextStateRepository,
+)
 from memoli_agent.agent.memory.runtime import MemoryRuntime
 from memoli_agent.agent.plugins.hooks import HookBus
 from memoli_agent.agent.skills.runtime import SkillRuntime
@@ -54,15 +58,23 @@ def build_tool_registry(
     skill_runtime: SkillRuntime | None = None,
     trajectory_store: TrajectoryStore | None = None,
     mcp_names_provider: Callable[[], set[str]] | None = None,
+    context_repository: ContextStateRepository | None = None,
 ) -> ToolRegistry:
     """创建并注册内置工具。"""
 
-    registry = ToolRegistry(hook_bus=hook_registry)
+    disclosure_repository = context_repository
+    if config.tools.tool_search_enabled and disclosure_repository is None:
+        disclosure_repository = InMemoryContextStateRepository()
+    registry = ToolRegistry(
+        hook_bus=hook_registry,
+        disclosure_repository=disclosure_repository,
+    )
     workspace = Path(config.runtime.workspace)
     state = working_state or WorkingStateStore()
 
-    registry.register(
-        CodeRunTool(
+    if config.tools.code_runner != "disabled":
+        registry.register(
+            CodeRunTool(
             workspace,
             default_timeout_seconds=config.tools.code_timeout_seconds,
             max_output_chars=config.tools.code_max_output_chars,
@@ -74,8 +86,8 @@ def build_tool_registry(
             memory_mb=config.tools.code_memory_mb,
             cpus=config.tools.code_cpus,
             pids_limit=config.tools.code_pids,
+            )
         )
-    )
     registry.register(
         FileReadTool(
             workspace,

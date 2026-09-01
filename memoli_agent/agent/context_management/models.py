@@ -124,6 +124,20 @@ class ContextSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolDisclosure:
+    """One immutable deferred-tool schema disclosed within a Session epoch."""
+
+    session_key: str
+    conversation_epoch: int
+    tool_name: str
+    schema_json: str
+    schema_hash: str
+    tool_call_id: str
+    created_at: str
+    sequence: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenToolPreview:
     preview_id: str
     session_key: str

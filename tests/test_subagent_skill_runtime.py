@@ -118,6 +118,7 @@ def test_subagent_catalog_uses_actual_profile_tools_and_independent_snapshot(
             )
         )
         assert not invalid.success
-        assert invalid.metadata["rejection_reason"] == "invalid-arguments"
+        assert invalid.metadata["error"] == "ToolArgumentsInvalid"
+        assert invalid.metadata["validator"] == "additionalProperties"
     finally:
         repository.close()

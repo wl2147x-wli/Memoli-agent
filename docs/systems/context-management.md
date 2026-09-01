@@ -73,7 +73,12 @@ Provider 返回 `provider-context-length` 时，同一 trace 至多进行一次 
 
 ## 渐进工具 schema
 
-`[tools].tool_search_enabled = false` 是兼容默认值：所有启用工具以名称稳定排序后进入 Session snapshot。启用后，基础工具与 `tool_search` 先冻结；之后注册的插件、MCP 或其他延迟工具只在 `tool_search` 选中后披露。已披露 schema 保持首次位置，不按调用频率或发现顺序重排。
+`[tools].tool_search_enabled = false` 是兼容默认值：所有启用工具以名称稳定排序后进入 Session snapshot。启用后，基础工具与 `tool_search` 先冻结；之后注册的插件、MCP 或其他延迟工具只在 `tool_search` 选中后披露。披露记录以 `(session_key, conversation_epoch, tool_name)` 持久化，保存规范 schema、schema hash、来源 call id 和首次披露顺序；重复搜索幂等，其他 Session/Epoch 不继承。
+
+Context Compiler 在稳定 base snapshot 后追加当前 Session/Epoch 的披露记录，形成
+effective tool schema 和独立 effective schema hash；旧前缀和首次披露位置保持不变。
+Reasoner 的下一次 Provider 请求使用该有效集合，同时将其名称作为本次工具执行授权，
+因此未披露延迟工具不能靠猜测名称越过 `tool_search`。
 
 稳定快照键改为 `(session_key, conversation_epoch)`。普通能力新增仍只影响新 epoch；安全撤销始终 fail-closed，立即阻止执行并使当前 snapshot 进入失效状态，不能继续向模型宣称已撤销工具可用。新 epoch 使用当时的 system/Skill/tool 快照。
 
