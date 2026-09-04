@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memoli_agent.agent.llm.contracts import LLMProvider, ModelCapabilities
+from memoli_agent.agent.llm.contracts import (
+    LLMProvider,
+    ModelCapabilities,
+    ReasoningMode,
+    ReasoningPolicy,
+    ReasoningVisibility,
+)
+from memoli_agent.agent.llm.openai_responses_provider import OpenAIResponsesProvider
 from memoli_agent.agent.llm.router import ModelRouter, ProviderTarget
 from memoli_agent.agent.provider import AnthropicProvider, EchoProvider, OpenAIProvider
 from memoli_agent.bootstrap.config import (
@@ -38,6 +45,7 @@ def build_model_provider(config: LLMConfig) -> ProviderBundle:
                 context_window_tokens=config.context_window_tokens,
                 context_safety_margin_tokens=config.context_safety_margin_tokens,
                 token_estimator=config.token_estimator,
+                reasoning_policy=_reasoning_policy(config),
             ),
             (),
         )
@@ -68,6 +76,7 @@ def build_model_provider(config: LLMConfig) -> ProviderBundle:
             context_safety_margin_tokens=profile.context_safety_margin_tokens,
             token_estimator=profile.token_estimator,
             temperature=profile.temperature,
+            reasoning_policy=_reasoning_policy(profile),
         )
 
     targets = {name: target(name) for name in config.models}
@@ -85,6 +94,14 @@ def _legacy_provider(config: LLMConfig) -> LLMProvider:
             model=config.model,
             api_key=config.api_key,
             base_url=config.base_url or "https://api.anthropic.com",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+        )
+    if provider_name == "openai-responses":
+        return OpenAIResponsesProvider(
+            model=config.model,
+            api_key=config.api_key,
+            base_url=config.base_url or "https://api.openai.com/v1",
             timeout_seconds=config.timeout_seconds,
             max_retries=config.max_retries,
         )
@@ -115,6 +132,15 @@ def _provider_for_endpoint(
             max_retries=endpoint.max_retries,
             name=name,
         )
+    if endpoint.protocol == "openai-responses":
+        return OpenAIResponsesProvider(
+            model=default_model,
+            api_key=endpoint.api_key,
+            base_url=endpoint.base_url or "https://api.openai.com/v1",
+            timeout_seconds=endpoint.timeout_seconds,
+            max_retries=endpoint.max_retries,
+            name=name,
+        )
     return OpenAIProvider(
         model=default_model,
         api_key=endpoint.api_key,
@@ -137,8 +163,18 @@ def _legacy_capabilities(provider: str) -> ModelCapabilities:
     if provider == "echo":
         return ModelCapabilities.from_strings(["text", "tools"])
     values = ["text", "tools", "reasoning", "streaming"]
-    if provider in {"openai", "openai-compatible"}:
+    if provider in {"openai", "openai-responses", "openai-compatible"}:
         values.append("structured-output")
     if provider == "anthropic":
         values.append("prompt-cache")
     return ModelCapabilities.from_strings(values)
+
+
+def _reasoning_policy(config: object) -> ReasoningPolicy:
+    return ReasoningPolicy(
+        mode=ReasoningMode(str(getattr(config, "reasoning_mode", "off"))),
+        effort=getattr(config, "reasoning_effort", None),
+        visibility=ReasoningVisibility(
+            str(getattr(config, "reasoning_visibility", "hidden"))
+        ),
+    )

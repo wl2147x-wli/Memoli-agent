@@ -16,6 +16,8 @@ class PresentationEventKind(StrEnum):
     TURN_STARTED = "turn_started"
     MODEL_STARTED = "model_started"
     TEXT_DELTA = "text_delta"
+    PROGRESS_UPDATE = "progress_update"
+    REASONING_SUMMARY = "reasoning_summary"
     USAGE_UPDATED = "usage_updated"
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
@@ -146,6 +148,24 @@ class PresentationEventHub:
                 event.text,
                 turn_id=trace_id,
                 step_id="model",
+            )
+        elif event.kind == ModelEventKind.PROGRESS_UPDATE and event.text:
+            projected = PresentationEvent(
+                PresentationEventKind.PROGRESS_UPDATE,
+                session_key,
+                trace_id,
+                event.text,
+                turn_id=trace_id,
+                step_id="agent-progress",
+            )
+        elif event.kind == ModelEventKind.REASONING_SUMMARY_DELTA and event.text:
+            projected = PresentationEvent(
+                PresentationEventKind.REASONING_SUMMARY,
+                session_key,
+                trace_id,
+                event.text,
+                turn_id=trace_id,
+                step_id="reasoning-summary",
             )
         elif event.kind == ModelEventKind.TOOL_CALL_DELTA and event.tool_name:
             # 原始 arguments_delta 永远不进入表现合同。

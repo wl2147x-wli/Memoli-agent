@@ -73,18 +73,25 @@ Provider 返回 `provider-context-length` 时，同一 trace 至多进行一次 
 
 ## 渐进工具 schema
 
-`[tools].tool_search_enabled = false` 是兼容默认值：所有启用工具以名称稳定排序后进入 Session snapshot。启用后，基础工具与 `tool_search` 先冻结；之后注册的插件、MCP 或其他延迟工具只在 `tool_search` 选中后披露。披露记录以 `(session_key, conversation_epoch, tool_name)` 持久化，保存规范 schema、schema hash、来源 call id 和首次披露顺序；重复搜索幂等，其他 Session/Epoch 不继承。
+`[tools].tool_search_enabled = false` 是兼容默认值：所有启用工具以名称稳定排序后进入能力快照。能力快照以 `(session_key, conversation_epoch, capability_revision)` 保存；每个新 turn 首次编译时核对 system prompt、Skill catalog、工具 schema 与布局的规范指纹。指纹未变则跨重启复用原 revision，变化则在同一 epoch 追加 revision，下一 turn 自动生效且不丢失历史；同一 turn 的模型与工具循环始终固定到开始时的 revision。
+
+启用 Tool Search 后，基础工具与 `tool_search` 先冻结；之后注册的插件、MCP 或其他延迟工具只在 `tool_search` 选中后披露。披露记录与 capability revision 绑定，保存规范 schema、schema hash、来源 call id 和首次披露顺序；重复搜索幂等，其他 Session、Epoch 或 revision 不会错误继承。安全撤销仍立即 fail closed，而普通新增、删除或 schema 变化在下一 turn 创建新 revision。
 
 Context Compiler 在稳定 base snapshot 后追加当前 Session/Epoch 的披露记录，形成
 effective tool schema 和独立 effective schema hash；旧前缀和首次披露位置保持不变。
 Reasoner 的下一次 Provider 请求使用该有效集合，同时将其名称作为本次工具执行授权，
 因此未披露延迟工具不能靠猜测名称越过 `tool_search`。
 
-稳定快照键改为 `(session_key, conversation_epoch)`。普通能力新增仍只影响新 epoch；安全撤销始终 fail-closed，立即阻止执行并使当前 snapshot 进入失效状态，不能继续向模型宣称已撤销工具可用。新 epoch 使用当时的 system/Skill/tool 快照。
+conversation epoch 继续定义 `/clear`、历史、archive frontier 和冻结预览边界；能力 revision 只定义模型在一个 turn 中看到的 system/Skill/tool 版本。普通能力变化不再要求 `/clear`。安全撤销始终 fail-closed，立即阻止执行并使当前 revision 失效；新 turn 使用当时有效能力，新 epoch 则从 revision 1 开始。
 
 ## Token 估算与诊断
 
 Token estimator 通过模型 profile 选择；支持的模型使用 tokenizer adapter，不支持时使用 `ConservativeTokenEstimator` 并标注 `exact=false`。预算包含 messages、tool schemas 和协议固定开销。
+
+通用消息使用同一份可移植规范化表示参与 Provider 发送、Token 估算、上下文哈希与
+缓存键。活跃交换中的 assistant 工具调用及关联 tool result 是不可拆分后缀，压缩不能
+重排或部分删除。不透明 Provider 续接信封不属于通用上下文，不进入压缩、归档、Hook、
+轨迹或长期记忆；其实际 Token 只采用 Provider 返回的 usage 进行预算诊断。
 
 诊断同时记录：
 

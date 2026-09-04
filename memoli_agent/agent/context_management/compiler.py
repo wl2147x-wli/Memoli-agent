@@ -19,7 +19,10 @@ from memoli_agent.agent.context_management.models import (
     LayerBudget,
     normalized_cache_usage,
 )
-from memoli_agent.agent.context_management.repository import ContextStateRepository
+from memoli_agent.agent.context_management.repository import (
+    ContextStateError,
+    ContextStateRepository,
+)
 from memoli_agent.agent.context_management.tokens import TokenEstimator
 from memoli_agent.agent.types import ChatMessage
 
@@ -101,6 +104,7 @@ class ContextCompiler:
         epoch: int = 0,
         compacted_this_turn: bool = False,
         revoked_tool_names: frozenset[str] = frozenset(),
+        capability_revision: int | None = None,
     ) -> ContextCompilation:
         if not messages or messages[0].role != "system":
             raise ContextBudgetExhausted("required system prompt is missing")
@@ -109,10 +113,17 @@ class ContextCompiler:
             raise ContextCompactionCircuitOpen(
                 "context compaction circuit is open for this session"
             )
-        snapshot = self._snapshot(
-            session_key, epoch, session_instance_id, messages, tools or []
+        snapshot, capability_diagnostics = self._snapshot(
+            session_key,
+            epoch,
+            session_instance_id,
+            messages,
+            tools or [],
+            capability_revision,
         )
-        disclosures = self.repository.list_tool_disclosures(session_key, epoch)
+        disclosures = self.repository.list_tool_disclosures(
+            session_key, epoch, snapshot.capability_revision
+        )
         disclosed_tools: list[dict[str, Any]] = []
         disclosed_names: set[str] = set()
         for disclosure in disclosures:
@@ -121,6 +132,7 @@ class ContextCompiler:
                     session_key,
                     f"tool-disclosure-corrupt:{disclosure.tool_name}",
                     epoch=epoch,
+                    revision=snapshot.capability_revision,
                 )
                 raise ContextSnapshotInvalidated(
                     f"tool-disclosure-corrupt:{disclosure.tool_name}"
@@ -132,6 +144,7 @@ class ContextCompiler:
                     session_key,
                     f"tool-disclosure-invalid:{disclosure.tool_name}",
                     epoch=epoch,
+                    revision=snapshot.capability_revision,
                 )
                 raise ContextSnapshotInvalidated(
                     f"tool-disclosure-invalid:{disclosure.tool_name}"
@@ -139,7 +152,12 @@ class ContextCompiler:
             disclosed_names.add(name)
             disclosed_tools.append(schema)
         self._mark_revoked_tools(snapshot, revoked_tool_names, disclosed_names)
-        snapshot = self.repository.get_snapshot(session_key, epoch) or snapshot
+        snapshot = (
+            self.repository.get_snapshot(
+                session_key, epoch, snapshot.capability_revision
+            )
+            or snapshot
+        )
         # §7.2 安全撤销 fail-closed：snapshot 因能力撤销失效时，其冻结 schema 仍
         # 含已撤销能力；编译立即拒绝向模型暴露该能力（不静默替换为其他版本），
         # 仅留 audit 失效原因。恢复需新 epoch 重新冻结当前（不含撤销能力）schema。
@@ -157,7 +175,7 @@ class ContextCompiler:
             separators=(",", ":"),
         )
         effective_tool_hash = _hash(effective_tools_json)
-        diagnostics: list[ContextDiagnostic] = []
+        diagnostics: list[ContextDiagnostic] = list(capability_diagnostics)
         diagnostics.extend(
             ContextDiagnostic(
                 "tool-disclosed",
@@ -346,6 +364,7 @@ class ContextCompiler:
             stable_prefix_hash=snapshot.stable_prefix_hash,
             tool_schema_hash=effective_tool_hash,
             context_hash=context_hash,
+            capability_revision=snapshot.capability_revision,
             layers=layers,
             archive_generation=archives[-1].generation if archives else 0,
             working_state_revision=working_state_revision,
@@ -374,6 +393,7 @@ class ContextCompiler:
                 snapshot.session_key,
                 "tool-revoked:" + ",".join(revoked),
                 epoch=snapshot.conversation_epoch,
+                revision=snapshot.capability_revision,
             )
 
     def latest_summary(self, session_key: str) -> dict[str, Any]:
@@ -432,10 +452,17 @@ class ContextCompiler:
         session_instance_id: str,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]],
-    ) -> ContextSnapshot:
-        current = self.repository.get_snapshot(session_key, epoch)
-        if current is not None:
-            return current
+        capability_revision: int | None,
+    ) -> tuple[ContextSnapshot, tuple[ContextDiagnostic, ...]]:
+        if capability_revision is not None:
+            pinned = self.repository.get_snapshot(
+                session_key, epoch, capability_revision
+            )
+            if pinned is None:
+                raise ContextStateError(
+                    f"capability revision not found: {capability_revision}"
+                )
+            return pinned, ()
         skill = next(
             (
                 item.content
@@ -466,8 +493,14 @@ class ContextCompiler:
             datetime.now(UTC).isoformat(),
             conversation_epoch=epoch,
         )
-        self.repository.save_snapshot(snapshot)
-        return snapshot
+        previous = self.repository.get_snapshot(session_key, epoch)
+        committed = self.repository.save_snapshot(snapshot)
+        if (
+            previous is None
+            or previous.capability_revision == committed.capability_revision
+        ):
+            return committed, ()
+        return committed, _capability_change_diagnostics(previous, committed)
 
     def _partition(
         self,
@@ -1028,3 +1061,58 @@ def _tool_schema_name(schema: object) -> str:
     if not isinstance(function, dict):
         return ""
     return str(function.get("name") or "")
+
+
+def _capability_change_diagnostics(
+    previous: ContextSnapshot, current: ContextSnapshot
+) -> tuple[ContextDiagnostic, ...]:
+    """生成不携带 schema 正文的名称级能力差异。"""
+
+    before = {
+        _tool_schema_name(item): _hash(
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        for item in json.loads(previous.tool_schemas_json)
+    }
+    after = {
+        _tool_schema_name(item): _hash(
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        for item in json.loads(current.tool_schemas_json)
+    }
+    diagnostics = [
+        ContextDiagnostic(
+            "capability-revision-created",
+            block_id=f"{previous.capability_revision}->{current.capability_revision}",
+            kind="capability-snapshot",
+            source="runtime",
+            reason="stable-prefix-changed",
+        )
+    ]
+    diagnostics.extend(
+        ContextDiagnostic("tool-added", block_id=name, kind="tool-schema")
+        for name in sorted(after.keys() - before.keys())
+    )
+    diagnostics.extend(
+        ContextDiagnostic("tool-removed", block_id=name, kind="tool-schema")
+        for name in sorted(before.keys() - after.keys())
+    )
+    diagnostics.extend(
+        ContextDiagnostic("tool-schema-changed", block_id=name, kind="tool-schema")
+        for name in sorted(before.keys() & after.keys())
+        if before[name] != after[name]
+    )
+    for changed, name in (
+        (previous.system_prompt_hash != current.system_prompt_hash, "system-prompt"),
+        (previous.skill_catalog_hash != current.skill_catalog_hash, "skill-catalog"),
+        (previous.layout_version != current.layout_version, "layout"),
+    ):
+        if changed:
+            diagnostics.append(
+                ContextDiagnostic(
+                    "capability-component-changed",
+                    block_id=name,
+                    kind="stable-prefix",
+                )
+            )
+    return tuple(diagnostics)

@@ -18,6 +18,12 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+def _legacy_profile_capabilities(provider: str) -> list[str]:
+    if provider == "echo":
+        return ["text", "tools"]
+    return ["text", "tools", "reasoning", "streaming"]
+
+
 @dataclass(slots=True)
 class RuntimeConfig:
     """应用运行目录配置。"""
@@ -39,7 +45,13 @@ class LLMProviderEndpointConfig:
 
     def __post_init__(self) -> None:
         self.protocol = self.protocol.strip().lower()
-        if self.protocol not in {"openai", "openai-compatible", "anthropic", "echo"}:
+        if self.protocol not in {
+            "openai",
+            "openai-responses",
+            "openai-compatible",
+            "anthropic",
+            "echo",
+        }:
             raise ValueError(f"未知 llm provider protocol：{self.protocol}")
         if self.timeout_seconds <= 0 or self.max_retries < 0:
             raise ValueError("LLM endpoint 超时必须大于 0，重试次数不能小于 0。")
@@ -59,6 +71,9 @@ class LLMModelProfileConfig:
     context_safety_margin_tokens: int = 4_096
     token_estimator: str = "conservative"
     temperature: float | None = None
+    reasoning_mode: str = "off"
+    reasoning_effort: str | None = None
+    reasoning_visibility: str = "hidden"
 
     def __post_init__(self) -> None:
         allowed = {
@@ -87,6 +102,22 @@ class LLMModelProfileConfig:
             >= self.context_window_tokens
         ):
             raise ValueError("模型 Profile 必须保留正的输入上下文预算。")
+        self._validate_reasoning_policy()
+
+    def _validate_reasoning_policy(self) -> None:
+        if self.reasoning_mode not in {"off", "adaptive"}:
+            raise ValueError("模型 Profile reasoning_mode 配置无效。")
+        if self.reasoning_effort not in {None, "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("模型 Profile reasoning_effort 配置无效。")
+        if self.reasoning_visibility not in {"hidden", "summary", "updates"}:
+            raise ValueError("模型 Profile reasoning_visibility 配置无效。")
+        if self.reasoning_mode == "off" and (
+            self.reasoning_effort is not None
+            or self.reasoning_visibility != "hidden"
+        ):
+            raise ValueError("reasoning_mode=off 时不能设置强度或可见摘要。")
+        if self.reasoning_mode != "off" and "reasoning" not in self.capabilities:
+            raise ValueError("启用推理的模型 Profile 必须声明 reasoning 能力。")
 
 
 @dataclass(slots=True)
@@ -113,6 +144,9 @@ class LLMConfig:
     context_safety_margin_tokens: int = 4_096
     token_estimator: str = "conservative"
     stream: bool = True
+    reasoning_mode: str = "off"
+    reasoning_effort: str | None = None
+    reasoning_visibility: str = "hidden"
     providers: dict[str, LLMProviderEndpointConfig] = field(default_factory=dict)
     models: dict[str, LLMModelProfileConfig] = field(default_factory=dict)
     routes: LLMRoutesConfig = field(default_factory=LLMRoutesConfig)
@@ -125,6 +159,7 @@ class LLMConfig:
         if self.provider not in {
             "echo",
             "openai",
+            "openai-responses",
             "openai-compatible",
             "anthropic",
         }:
@@ -143,6 +178,18 @@ class LLMConfig:
             >= self.context_window_tokens
         ):
             raise ValueError("LLM 必须保留正的输入上下文预算。")
+        LLMModelProfileConfig(
+            provider=self.provider,
+            model=self.model,
+            capabilities=_legacy_profile_capabilities(self.provider),
+            max_output_tokens=self.max_output_tokens,
+            context_window_tokens=self.context_window_tokens,
+            context_safety_margin_tokens=self.context_safety_margin_tokens,
+            token_estimator=self.token_estimator,
+            reasoning_mode=self.reasoning_mode,
+            reasoning_effort=self.reasoning_effort,
+            reasoning_visibility=self.reasoning_visibility,
+        )
 
     @property
     def uses_profiles(self) -> bool:
@@ -300,6 +347,7 @@ class MemoryEmbeddingConfig:
 
     enabled: bool = False
     provider: str = "openai-compatible"
+    api_key: str = field(default="", repr=False)
     model: str = ""
     version: str = "1"
     base_url: str = "https://api.openai.com/v1"
@@ -395,6 +443,7 @@ class MemoryExtractorConfig:
     """离线 Candidate Extractor 的独立配置。"""
 
     provider: str = "disabled"
+    api_key: str = field(default="", repr=False)
     model: str = ""
     version: str = "1"
     schema_version: str = "1"

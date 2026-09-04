@@ -10,6 +10,10 @@
 - editable install 已生成 `memoli.exe` 与 `memoli-skills.exe` 两个 console script。
 - interactive/plain 已收敛到共享 `CLIController` 与 renderer；plain adapter 仅保留
   逐行 I/O。等价性测试覆盖命令、普通提示、队列拒绝、退出、EOF 和初始化失败降级。
+- 模型推理内容默认隐藏。配置 `reasoning_visibility = "summary"` 时，仅在回答阶段
+  显示有界、脱敏且标注为“推理摘要”的提供商摘要；配置为 `"updates"` 时还允许
+  显示同样受限的流式摘要更新。原始思维链、签名、加密续接内容和工具参数不会进入
+  CLI 展示事件。取消或错误不会输出当前交换中的私有续接状态。
 - 圆角输入框覆盖 20/40/80/120 列、40→20 resize、中文宽字符、多行、slash 候选、
   异步 invalidate、busy/queue 快捷提示和 plain 无框降级；实现只使用 prompt_toolkit
   公共 Application/Layout/Buffer/Control API，不产生渲染诊断文件。
@@ -37,7 +41,8 @@ prompt_toolkit pipe input/记录型 Windows Output 验证圆角、青色样式�
 
 1. 运行 `memoli`，输入 `/` 并检查候选、颜色和键位。
 2. 粘贴中文多行提示，在流式输出期间调整窗口宽度。
-3. 触发一个工具调用，确认只显示安全工具名、状态和耗时。
+3. 分别使用 `hidden`、`summary` 和 `updates` 触发工具调用，确认默认不显示推理，
+   后两者只显示带“推理摘要”标签的安全摘要；工具仅显示安全名称、状态和耗时。
 4. 运行中输入 `/stop`，再提交下一条消息，确认 Runtime 未退出。
 5. 设置 `NO_COLOR=1` 以及 `channels.cli.interactive=false` 验证降级。
 

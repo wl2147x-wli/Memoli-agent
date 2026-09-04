@@ -215,6 +215,7 @@ def test_mixed_language_large_schema_dynamic_tail_and_restart(tmp_path: Path) ->
         ],
         tools=[schema],
     )
-    assert restored.stable_prefix_hash == first.stable_prefix_hash
+    assert restored.capability_revision == first.capability_revision + 1
+    assert restored.stable_prefix_hash != first.stable_prefix_hash
     assert restored.tool_schema_hash == first.tool_schema_hash
     reopened.close()

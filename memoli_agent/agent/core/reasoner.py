@@ -31,6 +31,8 @@ from memoli_agent.agent.core.results import (
 from memoli_agent.agent.llm.contracts import (
     EventCallback,
     ModelMessage,
+    ProviderExchange,
+    ReasoningPolicy,
     ToolUseBlock,
     model_message_to_chat,
 )
@@ -111,6 +113,7 @@ class Reasoner:
     context_compiler: ContextCompiler | None = None
     tool_result_previewer: ToolResultPreviewer | None = None
     task_compactor: TaskAwareCompactor | None = None
+    reasoning_policy: ReasoningPolicy = field(default_factory=ReasoningPolicy)
 
     def __post_init__(self) -> None:
         if self.max_iterations <= 0:
@@ -146,6 +149,7 @@ class Reasoner:
         trace_prestarted = trace_id is not None and root_span_id is not None
         trace_id = trace_id or new_trace_id()
         root_span_id = root_span_id or new_span_id()
+        exchange = ProviderExchange(trace_id, reasoning_policy=self.reasoning_policy)
         started_at = utc_now_iso()
         started_monotonic = time.monotonic()
         provider_name = str(
@@ -161,6 +165,7 @@ class Reasoner:
         emergency_retries = 0
         # §5.6 loop-guard：本轮已成功压缩则抑制后续 plan，单轮最多压缩一个批次。
         compacted_this_turn = False
+        capability_revision: int | None = None
         current_user_position = next(
             (
                 index
@@ -222,7 +227,7 @@ class Reasoner:
                 capture_mode=commit.capture_mode,
             )
             try:
-                await self.trajectory_store.record(
+                await cast(TrajectoryStore, self.trajectory_store).record(
                     NewTrajectoryEvent(
                         trace_id=trace_id,
                         span_id=root_span_id,
@@ -271,7 +276,7 @@ class Reasoner:
         )
         if not trace_prestarted:
             try:
-                await self.trajectory_store.record(
+                await cast(TrajectoryStore, self.trajectory_store).record(
                     NewTrajectoryEvent(
                         trace_id=trace_id,
                         span_id=root_span_id,
@@ -367,6 +372,7 @@ class Reasoner:
                             if self.tool_registry
                             else frozenset()
                         ),
+                        capability_revision=capability_revision,
                     )
                 except (ContextBudgetExhausted, ContextCompactionCircuitOpen) as exc:
                     return await _finish_turn(
@@ -396,6 +402,19 @@ class Reasoner:
                         fallback_used,
                         error_type=exc.error_type,
                         decision="snapshot-invalidated",
+                    )
+                except ContextStateError as exc:
+                    return await _finish_turn(
+                        trace,
+                        root_span,
+                        TerminationReason.FAILED,
+                        str(exc),
+                        iteration,
+                        steps,
+                        usage,
+                        fallback_used,
+                        error_type="context-state-error",
+                        decision="capability-revision-persist-failed",
                     )
                 # §5.2/§5.6：soft/hard 触发后经统一协调器压缩 plan.batch 并重编译；
                 # 压缩失败保原视图并计数，重编译后 hard 仍超预算才显式结束。
@@ -429,6 +448,7 @@ class Reasoner:
                     )
                 visible_messages = list(compilation.messages)
                 iteration_tools = list(compilation.tools)
+                capability_revision = compilation.capability_revision
                 compiled_metadata = compilation.metadata()
             llm_span_id = new_span_id()
             llm_started_at = utc_now_iso()
@@ -470,7 +490,7 @@ class Reasoner:
                         ),
                     )
                 # 模型请求先落盘，确保后续调用可以被完整审计。
-                await self.trajectory_store.record(
+                await cast(TrajectoryStore, self.trajectory_store).record(
                     NewTrajectoryEvent(
                         trace_id=trace_id,
                         span_id=llm_span_id,
@@ -496,6 +516,7 @@ class Reasoner:
                     iteration_tools,
                     session_key=session_key,
                     trace_id=trace_id,
+                    exchange=exchange,
                 ),
                 iteration,
             )
@@ -555,12 +576,14 @@ class Reasoner:
                             iteration_tools,
                             session_key=session_key,
                             trace_id=trace_id,
+                            exchange=exchange,
                         ),
                         iteration,
                     )
-                # §5.7：无法改善（压缩失败/熔断/最小必需仍超限/新请求未变小）
-                # 时不重试，保持原 Provider 错误由后续 response.error_type 分支
-                # 稳定结束，不以相同输入循环重试或切换窗口更小的 Provider。
+            exchange.accept(response)
+            # §5.7：无法改善（压缩失败/熔断/最小必需仍超限/新请求未变小）
+            # 时不重试，保持原 Provider 错误由后续 response.error_type 分支
+            # 稳定结束，不以相同输入循环重试或切换窗口更小的 Provider。
             if self.hook_bus is not None:
                 await self.hook_bus.observe(
                     HookName.MODEL_AFTER,
@@ -605,7 +628,7 @@ class Reasoner:
                 }
             )
             try:
-                await self.trajectory_store.record(
+                await cast(TrajectoryStore, self.trajectory_store).record(
                     NewTrajectoryEvent(
                         trace_id=trace_id,
                         span_id=llm_span_id,
@@ -632,6 +655,7 @@ class Reasoner:
                 return self._trace_write_failure(trace_id, iteration, steps, usage)
 
             if response.error_type:
+                exchange.fail()
                 steps.append(
                     StepSummary(
                         iteration=iteration,
@@ -658,6 +682,7 @@ class Reasoner:
             if not response.tool_calls:
                 retry_reason = _completion_retry_reason(response)
                 if retry_reason is None:
+                    exchange.complete()
                     steps.append(
                         StepSummary(
                             iteration=iteration,
@@ -758,7 +783,7 @@ class Reasoner:
                 )
                 try:
                     # 工具意图先提交，副作用工具不得在无证据时执行。
-                    await self.trajectory_store.record(
+                    await cast(TrajectoryStore, self.trajectory_store).record(
                         NewTrajectoryEvent(
                             trace_id=trace_id,
                             span_id=tool_span_id,
@@ -798,6 +823,7 @@ class Reasoner:
                         user_message_id=user_message_id,
                         user_content=current_user_content,
                         conversation_epoch=commit.epoch,
+                        capability_revision=capability_revision or 1,
                         allowed_tool_names=frozenset(
                             _schema_tool_names(iteration_tools)
                         ),
@@ -842,11 +868,13 @@ class Reasoner:
                 model_content = result.content
                 preview_metadata: dict[str, Any] = {}
                 if self.tool_result_previewer is not None:
-                    governed_content = self.trajectory_store.sanitize_for_capture(
-                        raw_content
-                    )
+                    governed_content = cast(
+                        TrajectoryStore, self.trajectory_store
+                    ).sanitize_for_capture(raw_content)
                     try:
-                        raw_event = await self.trajectory_store.record(
+                        raw_event = await cast(
+                            TrajectoryStore, self.trajectory_store
+                        ).record(
                             NewTrajectoryEvent(
                                 trace_id=trace_id,
                                 span_id=tool_span_id,
@@ -906,7 +934,7 @@ class Reasoner:
                     }
                 )
                 try:
-                    await self.trajectory_store.record(
+                    await cast(TrajectoryStore, self.trajectory_store).record(
                         NewTrajectoryEvent(
                             trace_id=trace_id,
                             span_id=tool_span_id,
@@ -941,7 +969,7 @@ class Reasoner:
                         )
                     )
                     try:
-                        await self.trajectory_store.record(
+                        await cast(TrajectoryStore, self.trajectory_store).record(
                             NewTrajectoryEvent(
                                 trace_id=trace_id,
                                 span_id=tool_span_id,
@@ -1113,6 +1141,7 @@ class Reasoner:
                         if self.tool_registry
                         else frozenset()
                     ),
+                    capability_revision=compilation.capability_revision,
                 )
             except (ContextBudgetExhausted, ContextCompactionCircuitOpen):
                 return compilation, True
@@ -1185,6 +1214,7 @@ class Reasoner:
                 working_state_revision=status_revision,
                 compacted_this_turn=True,
                 epoch=commit.epoch,
+                capability_revision=compilation.capability_revision,
             )
         except ContextBudgetExhausted:
             # 重编译仍超预算：soft 保原视图，hard 显式结束。
@@ -1200,6 +1230,7 @@ class Reasoner:
         *,
         session_key: str,
         trace_id: str,
+        exchange: ProviderExchange,
     ) -> LLMResponse:
         callback = self._build_model_event_callback(session_key, trace_id)
         await self._publish_presentation(
@@ -1219,6 +1250,8 @@ class Reasoner:
                 tools,
                 model=self.model_name,
                 stream=self.stream_model,
+                reasoning_policy=exchange.reasoning_policy,
+                continuation=exchange.continuation,
                 on_event=callback,
             )
         except ProviderError as primary_error:
@@ -1233,6 +1266,8 @@ class Reasoner:
                         tools,
                         model=self.model_name,
                         stream=False,
+                        reasoning_policy=exchange.reasoning_policy,
+                        continuation=exchange.continuation,
                         on_event=callback,
                     )
                 except ProviderError as recovery_error:
@@ -1247,6 +1282,7 @@ class Reasoner:
                 )
             if (
                 self.fallback_provider is not None
+                and exchange.continuation is None
                 and not primary_error.partial_stream
                 and primary_error.error_type != "provider-context-length"
             ):
@@ -1257,6 +1293,7 @@ class Reasoner:
                         tools,
                         model=self.model_name,
                         stream=self.stream_model,
+                        reasoning_policy=exchange.reasoning_policy,
                         on_event=callback,
                     )
                 except ProviderError as fallback_error:
@@ -1290,6 +1327,7 @@ class Reasoner:
                     attempts=(*primary_error.attempts, *response.attempts),
                     partial_stream=response.partial_stream,
                     capabilities=response.capabilities,
+                    continuation=response.continuation,
                 )
             return self._error_response(primary_error)
 

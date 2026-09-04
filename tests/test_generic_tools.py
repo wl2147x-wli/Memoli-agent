@@ -355,6 +355,28 @@ def test_registry_rejects_schema_invalid_arguments_before_tool_execution(
     assert not (tmp_path / "x.txt").exists()
 
 
+def test_registry_rejects_tool_outside_turn_capability_revision(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(FileWriteTool(tmp_path))
+    result = run(
+        registry.execute(
+            "file_write",
+            {"path": "x.txt", "content": "must-not-write"},
+            context=ToolExecutionContext(
+                "trace",
+                "session",
+                "call",
+                allowed_tool_names=frozenset(),
+            ),
+        )
+    )
+    assert result.success is False
+    assert result.content == "工具不存在：file_write"
+    assert not (tmp_path / "x.txt").exists()
+
+
 def test_memory_tool_schemas_only_expose_consumed_fields(tmp_path: Path) -> None:
     registry = build_tool_registry(
         AppConfig(

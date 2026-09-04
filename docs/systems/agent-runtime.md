@@ -100,6 +100,11 @@ plain CLI。plain 降级只改变终端表现，不改变命令旁路、消息�
 fallback，不会生成 Echo 假成功。Provider 合同、配置、重试、streaming 和安全边界
 见 [LLM Providers](llm-providers.md)。
 
+一次模型决策及其工具结果续接构成一个瞬态 `ProviderExchange`。首次成功调用后，
+Provider、Profile、模型、协议与推理策略固定到交换结束；私有续接状态不会进入下一
+用户轮次。进程在交换中断时，Runtime 会报告精确续接不可恢复，不会根据可见文本重建
+签名、加密推理项或响应 ID。
+
 终止原因包括：
 
 - `completed`：得到可返回的最终回复。

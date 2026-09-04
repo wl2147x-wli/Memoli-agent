@@ -4,6 +4,12 @@
 
 插件 SHALL 通过与其身份、执行后端和批准权限绑定的受控上下文访问运行期能力，并 SHALL NOT 获得完整应用配置、Provider 凭证、裸数据库连接或可替换 Runtime 核心组件的对象。
 
+#### Scenario: Plugin extends behavior
+
+- **WHEN** 插件需要增加工具或生命周期行为
+- **THEN** 插件 SHALL 通过上下文提供的注册表完成注册
+- **AND** 插件 SHALL NOT 直接替换应用运行时核心组件
+
 #### Scenario: Trusted plugin extends behavior
 
 - **WHEN** 可信进程内插件需要增加工具或生命周期行为
@@ -25,6 +31,12 @@
 ### Requirement: Lifecycle and tool hooks
 
 系统 SHALL 使用类型化事件支持 `runtime.start`、`turn.before`、`context.contribute`、`model.before`、`model.after`、`tool.before`、`tool.after`、`response.transform`、`turn.after` 与 `runtime.stop` hooks，并 SHALL 区分 Transformer、Policy 和 Observer 三类行为合同。
+
+#### Scenario: Lifecycle hook fails
+
+- **WHEN** 生命周期 hook 抛出异常
+- **THEN** 系统 SHALL 在当前回合元数据中记录插件错误
+- **AND** 主对话 SHALL 继续执行
 
 #### Scenario: Transformer contributes context
 

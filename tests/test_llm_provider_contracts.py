@@ -12,6 +12,12 @@ from memoli_agent.agent.llm.contracts import (
     ModelCapabilities,
     ModelMessage,
     ModelRequest,
+    OpaqueContinuation,
+    ProviderExchange,
+    ReasoningMode,
+    ReasoningPolicy,
+    ReasoningSummaryBlock,
+    ReasoningVisibility,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -22,10 +28,16 @@ from memoli_agent.agent.llm.errors import (
     AuthenticationProviderError,
     ProviderNetworkError,
     UnsupportedCapabilityError,
+    UnsupportedReasoningPolicyError,
 )
 from memoli_agent.agent.llm.openai_provider import OpenAIProvider
 from memoli_agent.agent.llm.router import ModelRouter, ProviderTarget
-from memoli_agent.agent.provider import EchoProvider, LLMResponse, ScriptedProvider
+from memoli_agent.agent.provider import (
+    EchoProvider,
+    LLMResponse,
+    ScriptedProvider,
+    invoke_provider,
+)
 from memoli_agent.bootstrap.config import load_config
 from memoli_agent.bootstrap.providers import build_model_provider
 
@@ -57,6 +69,77 @@ def test_invalid_role_block_combinations_are_rejected() -> None:
         ModelMessage("assistant", (ToolResultBlock("call-1", "ok"),))
     with pytest.raises(ValueError, match="user"):
         ModelMessage("user", (ThinkingBlock("private"),))
+
+
+def test_portable_serialization_keeps_summary_and_excludes_private_thinking() -> None:
+    chat = model_message_to_chat(
+        ModelMessage(
+            "assistant",
+            (
+                ThinkingBlock("private", signature="secret-signature"),
+                ReasoningSummaryBlock("safe summary"),
+                ToolUseBlock("call-1", "read", {"path": "a"}),
+            ),
+        )
+    )
+
+    serialized = chat.to_dict()
+
+    assert [block["type"] for block in serialized["blocks"]] == [
+        "reasoning_summary",
+        "tool_use",
+    ]
+    assert "secret-signature" not in repr(serialized)
+
+
+def test_invoke_provider_propagates_reasoning_policy() -> None:
+    provider = ScriptedProvider([LLMResponse("done")])
+    policy = ReasoningPolicy(
+        ReasoningMode.ADAPTIVE, "high", ReasoningVisibility.HIDDEN
+    )
+
+    asyncio.run(
+        invoke_provider(
+            provider,
+            [model_message_to_chat(ModelMessage("user", (TextBlock("go"),)))],
+            reasoning_policy=policy,
+        )
+    )
+
+    assert provider.calls[0].effective_reasoning_policy == policy
+
+
+def test_provider_exchange_discards_private_state_on_terminal_states() -> None:
+    policy = ReasoningPolicy(ReasoningMode.ADAPTIVE)
+    continuation = OpaqueContinuation(
+        "scripted",
+        items=({"type": "reasoning", "encrypted_content": "private"},),
+        reasoning_policy=policy,
+    )
+    exchange = ProviderExchange("exchange-1", reasoning_policy=policy)
+    exchange.accept(
+        LLMResponse(
+            "",
+            provider="scripted",
+            protocol="scripted",
+            continuation=continuation,
+        )
+    )
+    assert exchange.continuation is continuation
+
+    exchange.complete()
+    assert exchange.status == "completed"
+    assert exchange.continuation is None
+
+    failed = ProviderExchange("exchange-2", continuation=continuation)
+    failed.fail()
+    assert failed.status == "failed"
+    assert failed.continuation is None
+
+    cancelled = ProviderExchange("exchange-3", continuation=continuation)
+    cancelled.cancel()
+    assert cancelled.status == "cancelled"
+    assert cancelled.continuation is None
 
 
 def test_router_falls_back_only_for_retryable_provider_failure() -> None:
@@ -152,6 +235,65 @@ def test_router_rejects_missing_capability_before_network_call() -> None:
     assert not provider.calls
 
 
+def test_router_pins_continuation_to_original_profile() -> None:
+    continuation = OpaqueContinuation(
+        "scripted",
+        items=({"type": "thinking", "thinking": "", "signature": "sig"},),
+        provider="primary",
+        profile="main",
+        model="model-a",
+        reasoning_policy=ReasoningPolicy(ReasoningMode.ADAPTIVE),
+    )
+    primary = ScriptedProvider(
+        [ProviderNetworkError("down", provider="primary", retryable=True)],
+        name="primary",
+    )
+    backup = ScriptedProvider([LLMResponse("must not run")], name="backup")
+    capabilities = ModelCapabilities.from_strings(["text", "reasoning"])
+    router = ModelRouter(
+        ProviderTarget(
+            "main",
+            "model-a",
+            primary,
+            capabilities,
+            reasoning_policy=ReasoningPolicy(ReasoningMode.ADAPTIVE),
+        ),
+        (ProviderTarget("backup", "model-b", backup, capabilities),),
+    )
+
+    with pytest.raises(ProviderNetworkError):
+        asyncio.run(
+            router.complete(
+                ModelRequest(
+                    (ModelMessage("user", (TextBlock("continue"),)),),
+                    continuation=continuation,
+                )
+            )
+        )
+
+    assert len(primary.calls) == 1
+    assert not backup.calls
+
+
+def test_chat_completions_rejects_visible_reasoning_before_network() -> None:
+    class NoNetworkClient:
+        pass
+
+    provider = OpenAIProvider(
+        model="gpt-test", api_key="unused", client=NoNetworkClient()
+    )
+    request = ModelRequest(
+        (ModelMessage("user", (TextBlock("hi"),)),),
+        reasoning_policy=ReasoningPolicy(
+            ReasoningMode.ADAPTIVE,
+            visibility=ReasoningVisibility.SUMMARY,
+        ),
+    )
+
+    with pytest.raises(UnsupportedReasoningPolicyError):
+        asyncio.run(provider.complete(request))
+
+
 def test_echo_can_only_be_explicit_primary() -> None:
     capabilities = ModelCapabilities.from_strings(["text", "tools"])
     with pytest.raises(ValueError, match="Echo"):
@@ -201,6 +343,77 @@ fallback = ["deep"]
     assert config.routes.fallback == ["deep"]
     assert "openai-secret" not in repr(config)
     assert "anthropic-secret" not in repr(config)
+
+
+def test_reasoning_policy_config_is_explicit_and_legacy_default_is_off(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[llm.providers.primary]
+protocol = "openai-responses"
+api_key = "test-only"
+
+[llm.models.main]
+provider = "primary"
+model = "gpt-test"
+capabilities = ["text", "tools", "reasoning", "streaming"]
+reasoning_mode = "adaptive"
+reasoning_effort = "high"
+reasoning_visibility = "summary"
+
+[llm.routes]
+agent = "main"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path).llm
+    bundle = build_model_provider(config)
+
+    assert config.models["main"].reasoning_mode == "adaptive"
+    assert bundle.targets["main"].reasoning_policy == ReasoningPolicy(
+        ReasoningMode.ADAPTIVE,
+        "high",
+        ReasoningVisibility.SUMMARY,
+    )
+    assert load_config("missing-reasoning-config.toml").llm.reasoning_mode == "off"
+    asyncio.run(bundle.provider.aclose())
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        'reasoning_mode = "always"',
+        'reasoning_mode = "off"\nreasoning_effort = "high"',
+        'reasoning_mode = "adaptive"\nreasoning_visibility = "summary"',
+    ],
+)
+def test_invalid_reasoning_policy_config_fails_fast(
+    tmp_path: Path, fields: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""
+[llm.providers.primary]
+protocol = "anthropic"
+api_key = "test-only"
+
+[llm.models.main]
+provider = "primary"
+model = "claude-test"
+capabilities = ["text"]
+{fields}
+
+[llm.routes]
+agent = "main"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reasoning"):
+        load_config(path)
 
 
 def test_formal_provider_missing_key_fails_fast(tmp_path: Path) -> None:

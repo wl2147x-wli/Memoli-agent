@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -93,8 +94,107 @@ def test_v4_repository_migrates_tool_disclosure_table(tmp_path: Path) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_disclosures'"
     ).fetchone()
     connection.close()
-    assert version == (5,)
+    assert version == (6,)
     assert table == ("tool_disclosures",)
+
+
+def test_v5_repository_migrates_snapshots_and_disclosures_to_revision_one(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "v5.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE schema_info (component TEXT PRIMARY KEY, version INTEGER NOT NULL);
+        INSERT INTO schema_info VALUES ('context-state', 5);
+        CREATE TABLE snapshots (
+            session_key TEXT NOT NULL,
+            conversation_epoch INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY(session_key, conversation_epoch)
+        );
+        CREATE TABLE tool_disclosures (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            conversation_epoch INTEGER NOT NULL,
+            tool_name TEXT NOT NULL,
+            schema_json TEXT NOT NULL,
+            schema_hash TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_key, conversation_epoch, tool_name)
+        );
+        """
+    )
+    legacy = _snapshot()
+    payload = json.dumps(asdict(legacy), ensure_ascii=False)
+    data = json.loads(payload)
+    data.pop("capability_revision")
+    connection.execute("INSERT INTO snapshots VALUES ('s', 0, ?)", (json.dumps(data),))
+    connection.execute(
+        "INSERT INTO tool_disclosures "
+        "(session_key, conversation_epoch, tool_name, schema_json, schema_hash, "
+        "tool_call_id, created_at) VALUES ('s', 0, 'later', '{}', ?, 'c', 'now')",
+        (hashlib.sha256(b"{}").hexdigest(),),
+    )
+    connection.commit()
+    connection.close()
+
+    repo = SQLiteContextStateRepository(database)
+    assert repo.get_snapshot("s", 0, 1) == legacy
+    assert repo.list_tool_disclosures("s", 0, 1)[0].capability_revision == 1
+    repo.close()
+
+    reopened = SQLiteContextStateRepository(database)
+    assert reopened.get_snapshot("s", 0, 1) == legacy
+    reopened.close()
+
+
+def test_v5_revision_migration_failure_rolls_back(tmp_path: Path) -> None:
+    database = tmp_path / "broken-v5.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE schema_info (component TEXT PRIMARY KEY, version INTEGER NOT NULL);
+        INSERT INTO schema_info VALUES ('context-state', 5);
+        CREATE TABLE snapshots (
+            session_key TEXT NOT NULL,
+            conversation_epoch INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY(session_key, conversation_epoch)
+        );
+        INSERT INTO snapshots VALUES ('s', 0, '{broken-json');
+        CREATE TABLE tool_disclosures (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            conversation_epoch INTEGER NOT NULL,
+            tool_name TEXT NOT NULL,
+            schema_json TEXT NOT NULL,
+            schema_hash TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_key, conversation_epoch, tool_name)
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(sqlite3.DatabaseError):
+        SQLiteContextStateRepository(database)
+
+    connection = sqlite3.connect(database)
+    version = connection.execute(
+        "SELECT version FROM schema_info WHERE component='context-state'"
+    ).fetchone()
+    snapshots = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()
+    temporary = connection.execute(
+        "SELECT name FROM sqlite_master WHERE name='snapshots_v6'"
+    ).fetchone()
+    connection.close()
+    assert version == (5,)
+    assert snapshots == (1,)
+    assert temporary is None
 
 
 @pytest.mark.parametrize("persistent", [False, True])
@@ -130,6 +230,48 @@ def test_repository_round_trip(tmp_path: Path, persistent: bool) -> None:
     assert repo.get_compaction_failures("s") == 2
     assert repo.list_tool_disclosures("s", 2) == (committed_disclosure,)
     assert repo.list_tool_disclosures("other", 2) == ()
+    repo.close()
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_snapshot_revisions_are_monotonic_and_immutable(
+    tmp_path: Path, persistent: bool
+) -> None:
+    repo = _make_repo(tmp_path, persistent)
+    first = repo.save_snapshot(_snapshot())
+    same = repo.save_snapshot(replace(_snapshot(), session_instance_id="restart"))
+    changed = repo.save_snapshot(
+        replace(
+            _snapshot(),
+            tool_schema_hash="new-tool-hash",
+            stable_prefix_hash="new-prefix-hash",
+        )
+    )
+
+    assert first.capability_revision == 1
+    assert same == first
+    assert changed.capability_revision == 2
+    assert repo.get_snapshot("s", 0, 1) == first
+    assert repo.get_snapshot("s", 0, 2) == changed
+    assert repo.get_snapshot("s", 0) == changed
+    repo.close()
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_concurrent_identical_snapshot_change_converges(
+    tmp_path: Path, persistent: bool
+) -> None:
+    repo = _make_repo(tmp_path, persistent)
+    repo.save_snapshot(_snapshot())
+    changed = replace(
+        _snapshot(),
+        tool_schema_hash="changed-tool-hash",
+        stable_prefix_hash="changed-prefix-hash",
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: repo.save_snapshot(changed), range(8)))
+    assert {item.capability_revision for item in results} == {2}
+    assert repo.get_snapshot("s", 0, 2) == results[0]
     repo.close()
 
 

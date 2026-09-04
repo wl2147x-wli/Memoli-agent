@@ -86,6 +86,11 @@ def reduce_event(
             streamed_text=full,
             active_text=full[-max_active_chars:],
         )
+    if event.kind in {
+        PresentationEventKind.PROGRESS_UPDATE,
+        PresentationEventKind.REASONING_SUMMARY,
+    }:
+        return replace(state, phase=event.kind.value)
     if event.kind == PresentationEventKind.USAGE_UPDATED:
         return replace(state, usage=event.usage)
     if event.kind in {
@@ -275,6 +280,26 @@ class TerminalRenderer:
                         self._write(pending_text)
                         pending_text = ""
                     self._write(_render_thinking(color=self.color))
+                elif item.event.kind == PresentationEventKind.PROGRESS_UPDATE:
+                    if pending_text:
+                        self._write(pending_text)
+                        pending_text = ""
+                    self._write(
+                        _render_text_line(
+                            f"进度：{item.event.text}", style="dim", color=self.color
+                        )
+                    )
+                elif item.event.kind == PresentationEventKind.REASONING_SUMMARY:
+                    if pending_text:
+                        self._write(pending_text)
+                        pending_text = ""
+                    self._write(
+                        _render_text_line(
+                            f"推理摘要：{item.event.text}",
+                            style="dim",
+                            color=self.color,
+                        )
+                    )
                 elif item.event.kind == PresentationEventKind.TURN_STARTED:
                     # 在新一轮开始时插入分隔线
                     if pending_text:

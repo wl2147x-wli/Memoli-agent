@@ -126,3 +126,19 @@ def test_enabled_search_freezes_base_and_discloses_deferred_schema(
         registry.execute("a_weather", {}, context=repeated_context)
     )
     assert allowed.success is True
+
+    later = compiler.compile(
+        session_key="session-a",
+        session_instance_id="instance-b",
+        messages=[
+            ChatMessage("system", "changed system"),
+            ChatMessage("user", "next turn"),
+        ],
+        tools=base,
+        epoch=3,
+    )
+    assert later.capability_revision == first.capability_revision + 1
+    assert "a_weather" not in [item["function"]["name"] for item in later.tools]
+    assert registry.disclosure_repository.list_tool_disclosures(
+        "session-a", 3, later.capability_revision
+    ) == ()

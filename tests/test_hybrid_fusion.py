@@ -19,6 +19,7 @@ from memoli_agent.agent.memory.models import (
     EvidenceRef,
     MemoryMutation,
     MemoryQuery,
+    MemoryQueryResult,
     MemoryScope,
 )
 from memoli_agent.agent.memory.sqlite_store import SQLiteMemoryStore
@@ -392,7 +393,7 @@ def test_multi_lane_protection_retains_more_than_disabling(tmp_path: Path) -> No
     store = SQLiteMemoryStore(tmp_path / "mem.db")
     _seed(store)
 
-    async def run(protection: bool) -> object:
+    async def run(protection: bool) -> MemoryQueryResult:
         retriever = _retriever(
             store,
             relative_threshold=0.99,

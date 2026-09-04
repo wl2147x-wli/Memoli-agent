@@ -120,6 +120,7 @@ class ContextSnapshot:
     # 不复用旧 epoch 的失效原因/frontier/冻结动态内容（spec「Deterministic
     # stable-prefix snapshots」）。默认 0 兼容旧数据与单 epoch 用例。
     conversation_epoch: int = 0
+    capability_revision: int = 1
     invalidated_reason: str = ""
 
 
@@ -135,6 +136,7 @@ class ToolDisclosure:
     tool_call_id: str
     created_at: str
     sequence: int = 0
+    capability_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +240,7 @@ class ContextCompilation:
     stable_prefix_hash: str
     tool_schema_hash: str
     context_hash: str
+    capability_revision: int = 1
     layers: tuple[LayerBudget, ...] = ()
     archive_generation: int = 0
     working_state_revision: int = 0
@@ -251,6 +254,7 @@ class ContextCompilation:
             "stable_prefix_hash": self.stable_prefix_hash,
             "tool_schema_hash": self.tool_schema_hash,
             "context_hash": self.context_hash,
+            "capability_revision": self.capability_revision,
             "archive_generation": self.archive_generation,
             "estimated_input_tokens": self.budget.estimated_input_tokens,
             "available_input_tokens": self.budget.available_input_tokens,

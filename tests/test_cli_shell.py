@@ -625,6 +625,52 @@ def test_presentation_hub_filters_thinking_and_arguments() -> None:
     assert asyncio.run(scenario()) == ("file_read", "visible")
 
 
+def test_presentation_hub_labels_bounded_reasoning_summary() -> None:
+    from memoli_agent.agent.llm.contracts import ModelEvent, ModelEventKind
+
+    hub = PresentationEventHub(max_text_chars=8)
+
+    async def scenario() -> PresentationEvent:
+        await hub.publish_model_event(
+            "cli:local",
+            "trace",
+            ModelEvent(
+                ModelEventKind.REASONING_SUMMARY_DELTA,
+                text="safe-summary-is-long",
+            ),
+        )
+        return await asyncio.wait_for(hub.consume(), 1)
+
+    event = asyncio.run(scenario())
+    assert event.kind is PresentationEventKind.REASONING_SUMMARY
+    assert event.text == "safe-sum"
+
+
+def test_renderer_marks_reasoning_summary_without_mixing_final_answer() -> None:
+    output: list[str] = []
+
+    async def scenario() -> None:
+        renderer = TerminalRenderer("cli:local", output.append, color=False)
+        await renderer.start()
+        renderer.submit_event(
+            PresentationEvent(
+                PresentationEventKind.REASONING_SUMMARY,
+                "cli:local",
+                "trace",
+                "检查工具结果",
+            )
+        )
+        renderer.submit_outbound(
+            OutboundMessage("cli", "local", "最终回答", {"trace_id": "trace"})
+        )
+        await renderer.close()
+
+    asyncio.run(scenario())
+    rendered = "".join(output)
+    assert "推理摘要：检查工具结果" in rendered
+    assert "Memoli > 最终回答" in rendered
+
+
 def test_stream_renderer_avoids_duplicate_final_text_and_bounds_tool_status() -> None:
     output: list[str] = []
 

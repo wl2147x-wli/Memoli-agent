@@ -19,6 +19,9 @@ from memoli_agent.agent.llm.contracts import (
     ModelEventKind,
     ModelMessage,
     ModelRequest,
+    OpaqueContinuation,
+    ReasoningSummaryBlock,
+    ReasoningVisibility,
     TextBlock,
     ThinkingBlock,
     TokenUsage,
@@ -38,6 +41,7 @@ from memoli_agent.agent.llm.errors import (
     ProviderTimeoutError,
     RateLimitProviderError,
     ResponseProtocolError,
+    UnsupportedReasoningPolicyError,
 )
 from memoli_agent.agent.llm.retry import RetryPolicy
 from memoli_agent.agent.types import ChatMessage
@@ -100,6 +104,7 @@ class AnthropicProvider:
                 provider=self.name,
                 model=request.model or self.model,
             )
+        self._validate_reasoning_policy(request)
         if request.stream:
             return await self._complete_stream(request, on_event)
         return await self._complete_once(request, on_event)
@@ -142,7 +147,7 @@ class AnthropicProvider:
                 ) from None
 
         response, attempts = await self.retry_policy.call(operation)
-        result = self._parse_response(response, attempts)
+        result = self._parse_response(response, attempts, request)
         await _emit(on_event, ModelEvent(ModelEventKind.COMPLETED, text=result.content))
         return result
 
@@ -213,10 +218,17 @@ class AnthropicProvider:
                     elif delta_type == "thinking_delta":
                         thinking = str(getattr(delta, "thinking", "") or "")
                         slot["thinking"] = str(slot.get("thinking", "")) + thinking
-                        await _emit(
-                            on_event,
-                            ModelEvent(ModelEventKind.THINKING_DELTA, text=thinking),
-                        )
+                        if (
+                            request.effective_reasoning_policy.visibility
+                            is ReasoningVisibility.UPDATES
+                        ):
+                            await _emit(
+                                on_event,
+                                ModelEvent(
+                                    ModelEventKind.REASONING_SUMMARY_DELTA,
+                                    text=thinking,
+                                ),
+                            )
                     elif delta_type == "signature_delta":
                         slot["signature"] = str(slot.get("signature", "")) + str(
                             getattr(delta, "signature", "") or ""
@@ -259,26 +271,37 @@ class AnthropicProvider:
                 if hasattr(result, "__await__"):
                     await result
 
-        blocks: list[TextBlock | ThinkingBlock | ToolUseBlock] = []
+        blocks: list[TextBlock | ReasoningSummaryBlock | ToolUseBlock] = []
         tool_calls: list[ToolCall] = []
+        wire_blocks: list[dict[str, Any]] = []
         for index in sorted(slots):
             slot = slots[index]
             block_type = slot.get("type")
             if block_type == "text":
-                blocks.append(TextBlock(str(slot.get("text", ""))))
+                text = str(slot.get("text", ""))
+                blocks.append(TextBlock(text))
+                wire_blocks.append({"type": "text", "text": text})
             elif block_type == "thinking":
-                blocks.append(
-                    ThinkingBlock(
-                        thinking=str(slot.get("thinking", "")),
-                        signature=str(slot.get("signature", "")) or None,
-                    )
+                thinking = str(slot.get("thinking", ""))
+                wire_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": str(slot.get("signature", "")),
+                    }
                 )
+                if (
+                    thinking
+                    and request.effective_reasoning_policy.visibility
+                    is not ReasoningVisibility.HIDDEN
+                ):
+                    blocks.append(ReasoningSummaryBlock(thinking))
             elif block_type == "redacted_thinking":
-                blocks.append(
-                    ThinkingBlock(
-                        redacted=True,
-                        opaque=str(slot.get("data", "")) or None,
-                    )
+                wire_blocks.append(
+                    {
+                        "type": "redacted_thinking",
+                        "data": str(slot.get("data", "")),
+                    }
                 )
             elif block_type == "tool_use":
                 raw_arguments = slot.get("arguments") or slot.get("input") or {}
@@ -292,6 +315,14 @@ class AnthropicProvider:
                 )
                 blocks.append(tool)
                 tool_calls.append(ToolCall(tool.name, dict(tool.arguments), tool.id))
+                wire_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool.id,
+                        "name": tool.name,
+                        "input": dict(tool.arguments),
+                    }
+                )
         message = ModelMessage("assistant", tuple(blocks))
         content = message.text
         response = LLMResponse(
@@ -308,12 +339,28 @@ class AnthropicProvider:
             attempt_count=len(attempts),
             attempts=attempts,
             capabilities=self.capabilities.to_strings(),
+            continuation=(
+                OpaqueContinuation(
+                    "anthropic",
+                    items=tuple(wire_blocks),
+                    provider=self.name,
+                    model=response_model,
+                    reasoning_policy=request.effective_reasoning_policy,
+                )
+                if tool_calls and any(
+                    item["type"] in {"thinking", "redacted_thinking"}
+                    for item in wire_blocks
+                )
+                else None
+            ),
         )
         await _emit(on_event, ModelEvent(ModelEventKind.COMPLETED, text=content))
         return response
 
     def _request_kwargs(self, request: ModelRequest) -> dict[str, Any]:
         system, messages = _to_anthropic_messages(request.messages)
+        if request.continuation is not None:
+            _apply_anthropic_continuation(messages, request.continuation)
         kwargs: dict[str, Any] = {
             "model": request.model or self.model,
             "max_tokens": request.max_output_tokens,
@@ -327,13 +374,38 @@ class AnthropicProvider:
                 kwargs["tool_choice"] = {"type": request.tool_choice}
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
-        if request.reasoning:
+        policy = request.effective_reasoning_policy
+        if policy.enabled:
             kwargs["thinking"] = {"type": "adaptive"}
+            if policy.effort is not None:
+                kwargs["output_config"] = {"effort": policy.effort}
         return kwargs
 
-    def _parse_response(self, response: Any, attempts: tuple[Any, ...]) -> LLMResponse:
-        blocks: list[TextBlock | ThinkingBlock | ToolUseBlock] = []
+    def _validate_reasoning_policy(self, request: ModelRequest) -> None:
+        policy = request.effective_reasoning_policy
+        continuation = request.continuation
+        if continuation is not None and continuation.protocol != self.protocol:
+            raise UnsupportedReasoningPolicyError(
+                "Anthropic 不能接收其他协议的续接信封。",
+                provider=self.name,
+                model=request.model or self.model,
+            )
+        if not policy.enabled and continuation is not None:
+            raise UnsupportedReasoningPolicyError(
+                "续接 Anthropic 推理状态时不能关闭推理。",
+                provider=self.name,
+                model=request.model or self.model,
+            )
+
+    def _parse_response(
+        self,
+        response: Any,
+        attempts: tuple[Any, ...],
+        request: ModelRequest,
+    ) -> LLMResponse:
+        blocks: list[TextBlock | ReasoningSummaryBlock | ToolUseBlock] = []
         tool_calls: list[ToolCall] = []
+        wire_blocks: list[dict[str, Any]] = []
         try:
             content_blocks = response.content
         except AttributeError as exc:
@@ -345,20 +417,30 @@ class AnthropicProvider:
         for index, raw in enumerate(content_blocks):
             block_type = str(getattr(raw, "type", "") or "")
             if block_type == "text":
-                blocks.append(TextBlock(str(getattr(raw, "text", "") or "")))
+                text = str(getattr(raw, "text", "") or "")
+                blocks.append(TextBlock(text))
+                wire_blocks.append({"type": "text", "text": text})
             elif block_type == "thinking":
-                blocks.append(
-                    ThinkingBlock(
-                        thinking=str(getattr(raw, "thinking", "") or ""),
-                        signature=str(getattr(raw, "signature", "") or "") or None,
-                    )
+                thinking = str(getattr(raw, "thinking", "") or "")
+                wire_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": str(getattr(raw, "signature", "") or ""),
+                    }
                 )
+                if (
+                    thinking
+                    and request.effective_reasoning_policy.visibility
+                    is not ReasoningVisibility.HIDDEN
+                ):
+                    blocks.append(ReasoningSummaryBlock(thinking))
             elif block_type == "redacted_thinking":
-                blocks.append(
-                    ThinkingBlock(
-                        redacted=True,
-                        opaque=str(getattr(raw, "data", "") or "") or None,
-                    )
+                wire_blocks.append(
+                    {
+                        "type": "redacted_thinking",
+                        "data": str(getattr(raw, "data", "") or ""),
+                    }
                 )
             elif block_type == "tool_use":
                 arguments = _strict_arguments(
@@ -371,6 +453,14 @@ class AnthropicProvider:
                 )
                 blocks.append(tool)
                 tool_calls.append(ToolCall(tool.name, arguments, tool.id))
+                wire_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool.id,
+                        "name": tool.name,
+                        "input": dict(tool.arguments),
+                    }
+                )
             else:
                 raise ResponseProtocolError(
                     f"Anthropic 返回未知内容块：{block_type}",
@@ -393,6 +483,20 @@ class AnthropicProvider:
             attempt_count=len(attempts),
             attempts=attempts,
             capabilities=self.capabilities.to_strings(),
+            continuation=(
+                OpaqueContinuation(
+                    "anthropic",
+                    items=tuple(wire_blocks),
+                    provider=self.name,
+                    model=str(getattr(response, "model", "") or self.model),
+                    reasoning_policy=request.effective_reasoning_policy,
+                )
+                if tool_calls and any(
+                    item["type"] in {"thinking", "redacted_thinking"}
+                    for item in wire_blocks
+                )
+                else None
+            ),
         )
 
 
@@ -448,6 +552,26 @@ def _to_anthropic_messages(
         else:
             rendered.append({"role": message.role, "content": content})
     return "\n\n".join(systems), rendered
+
+
+def _apply_anthropic_continuation(
+    messages: list[dict[str, Any]], continuation: OpaqueContinuation
+) -> None:
+    """用适配器私有信封恢复最近一次 assistant 工具调用的原始块。"""
+
+    if continuation.protocol != "anthropic" or continuation.version != 1:
+        raise UnsupportedReasoningPolicyError(
+            "Anthropic 续接信封的协议或版本不受支持。",
+            provider="anthropic",
+        )
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            message["content"] = [dict(item) for item in continuation.items]
+            return
+    raise ResponseProtocolError(
+        "Anthropic 续接请求缺少对应的 assistant 消息。",
+        provider="anthropic",
+    )
 
 
 def _to_anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:

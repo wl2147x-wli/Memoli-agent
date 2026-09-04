@@ -9,6 +9,9 @@ stream = true
 context_window_tokens = 131072
 context_safety_margin_tokens = 4096
 token_estimator = "conservative"
+reasoning_mode = "off" # off / adaptive；旧配置默认 off，不会自动增加成本。
+# reasoning_effort = "high" # low / medium / high / xhigh / max
+reasoning_visibility = "hidden" # hidden / summary / updates
 # 正式 Provider 默认流式；需要一次性最终输出时显式改为 false。
 
 # OpenAI：
@@ -17,6 +20,15 @@ token_estimator = "conservative"
 # api_key = "${OPENAI_API_KEY}"
 # base_url = "https://api.openai.com/v1"
 # max_retries = 1
+#
+# OpenAI Responses（Codex/原生推理与工具续接，必须显式选择）：
+# provider = "openai-responses"
+# model = "<openai-reasoning-model-id>"
+# api_key = "${OPENAI_API_KEY}"
+# base_url = "https://api.openai.com/v1"
+# reasoning_mode = "adaptive"
+# reasoning_effort = "high"
+# reasoning_visibility = "summary"
 #
 # Anthropic 原生 Messages：
 # provider = "anthropic"
@@ -30,6 +42,18 @@ token_estimator = "conservative"
 # api_key = "${MEMOLI_LLM_API_KEY}"
 # base_url = "https://api.deepseek.com/v1"
 # dialect = "deepseek"
+#
+# 本地 Qwen3 + vLLM（Qwen3 默认开启 thinking；Memoli 必须显式控制）：
+# provider = "openai-compatible"
+# model = "qwen3-1.7b"
+# api_key = "EMPTY"
+# base_url = "http://127.0.0.1:8000/v1"
+# dialect = "qwen-vllm"
+# context_window_tokens = 32768
+# context_safety_margin_tokens = 2048
+# max_output_tokens = 4096
+# reasoning_mode = "off" # 请求始终发送 enable_thinking=false；adaptive 则发送 true。
+# reasoning_visibility = "hidden"
 #
 # api_key 也可写成完整环境占位符：
 # api_key = "${MEMOLI_LLM_API_KEY}"
@@ -49,6 +73,9 @@ token_estimator = "conservative"
 # provider = "primary"
 # model = "<anthropic-model-id>"
 # capabilities = ["text", "tools", "reasoning", "streaming", "prompt-cache"]
+# reasoning_mode = "adaptive"
+# reasoning_effort = "high"
+# reasoning_visibility = "hidden"
 # context_window_tokens = 200000
 # context_safety_margin_tokens = 4096
 # token_estimator = "conservative"
@@ -126,6 +153,7 @@ maintenance_batch_size = 4
 [memory.embedding]
 enabled = false
 provider = "openai-compatible" # openai-compatible / deterministic / disabled
+api_key = "" # 可直接填写，或与下方 api_key_env 二选一；不要提交真实密钥。
 model = ""
 version = "1"
 base_url = "https://api.openai.com/v1"
@@ -187,6 +215,7 @@ dead_letter_stale_after_seconds = 86400
 
 [memory.offline.extractor]
 provider = "disabled" # disabled / deterministic / openai-compatible
+api_key = "" # 可直接填写，或与下方 api_key_env 二选一；不要提交真实密钥。
 model = ""
 version = "1"
 schema_version = "1"

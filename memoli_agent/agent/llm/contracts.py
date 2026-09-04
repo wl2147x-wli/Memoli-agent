@@ -23,6 +23,46 @@ class ModelCapability(StrEnum):
     PROMPT_CACHE = "prompt-cache"
 
 
+class ReasoningMode(StrEnum):
+    """跨提供商的推理启用策略。"""
+
+    OFF = "off"
+    ADAPTIVE = "adaptive"
+
+
+class ReasoningVisibility(StrEnum):
+    """允许投影到用户界面的提供商推理信息级别。"""
+
+    HIDDEN = "hidden"
+    SUMMARY = "summary"
+    UPDATES = "updates"
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningPolicy:
+    """一次逻辑交换中冻结的提供商中立推理策略。"""
+
+    mode: ReasoningMode = ReasoningMode.OFF
+    effort: str | None = None
+    visibility: ReasoningVisibility = ReasoningVisibility.HIDDEN
+
+    def __post_init__(self) -> None:
+        allowed_efforts = {"low", "medium", "high", "xhigh", "max"}
+        if self.effort is not None and self.effort not in allowed_efforts:
+            raise ValueError(f"未知推理强度：{self.effort}")
+        if self.mode is ReasoningMode.OFF and self.effort is not None:
+            raise ValueError("关闭推理时不能设置 reasoning_effort。")
+        if (
+            self.mode is ReasoningMode.OFF
+            and self.visibility is not ReasoningVisibility.HIDDEN
+        ):
+            raise ValueError("关闭推理时 reasoning_visibility 必须为 hidden。")
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode is not ReasoningMode.OFF
+
+
 @dataclass(frozen=True, slots=True)
 class ModelCapabilities:
     """一个模型 Profile 的显式能力集合。"""
@@ -57,12 +97,72 @@ class TextBlock:
 
 @dataclass(frozen=True, slots=True)
 class ThinkingBlock:
-    """Provider 明确返回的思考或脱敏思考块。"""
+    """旧版 Provider 私有思考块；仅供迁移读取，不得持久化。"""
 
     thinking: str = ""
     signature: str | None = None
     redacted: bool = False
     opaque: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningSummaryBlock:
+    """Provider 明确标记且允许展示的有界推理摘要。"""
+
+    text: str
+    kind: ReasoningVisibility = ReasoningVisibility.SUMMARY
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueContinuation:
+    """只能原样返回给同一协议的瞬态私有续接信封。"""
+
+    protocol: str
+    version: int = 1
+    items: tuple[Mapping[str, Any], ...] = ()
+    provider: str = ""
+    profile: str = ""
+    model: str = ""
+    reasoning_policy: ReasoningPolicy = field(default_factory=ReasoningPolicy)
+
+    def __post_init__(self) -> None:
+        if not self.protocol:
+            raise ValueError("不透明续接信封必须包含协议标签。")
+
+
+@dataclass(slots=True)
+class ProviderExchange:
+    """一次模型决策到工具结果续接结束的瞬态状态。"""
+
+    exchange_id: str
+    reasoning_policy: ReasoningPolicy = field(default_factory=ReasoningPolicy)
+    continuation: OpaqueContinuation | None = None
+    provider: str = ""
+    profile: str = ""
+    model: str = ""
+    protocol: str = ""
+    status: str = "active"
+
+    def accept(self, response: LLMResponse) -> None:
+        self.provider = response.provider or self.provider
+        self.profile = response.profile or self.profile
+        self.model = response.model or self.model
+        self.protocol = response.protocol or self.protocol
+        self.continuation = response.continuation
+        if response.continuation is not None:
+            self.reasoning_policy = response.continuation.reasoning_policy
+
+    def complete(self) -> None:
+        self.continuation = None
+        self.status = "completed"
+
+    def fail(self) -> None:
+        self.continuation = None
+        self.status = "failed"
+
+    def cancel(self) -> None:
+        self.continuation = None
+        self.status = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +194,13 @@ class ToolResultBlock:
             raise ValueError("工具结果必须包含 tool_use_id。")
 
 
-ContentBlock: TypeAlias = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock
+ContentBlock: TypeAlias = (
+    TextBlock
+    | ReasoningSummaryBlock
+    | ThinkingBlock
+    | ToolUseBlock
+    | ToolResultBlock
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +296,8 @@ class ModelEventKind(StrEnum):
     """流式模型事件种类。"""
 
     THINKING_DELTA = "thinking_delta"
+    REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
+    PROGRESS_UPDATE = "progress_update"
     TEXT_DELTA = "text_delta"
     TOOL_CALL_DELTA = "tool_call_delta"
     USAGE = "usage"
@@ -222,6 +330,8 @@ class ModelRequest:
     tool_choice: str | Mapping[str, Any] = "auto"
     temperature: float | None = None
     reasoning: bool = False
+    reasoning_policy: ReasoningPolicy = field(default_factory=ReasoningPolicy)
+    continuation: OpaqueContinuation | None = None
     stream: bool = False
     structured_output: Mapping[str, Any] | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -234,13 +344,21 @@ class ModelRequest:
         required = {ModelCapability.TEXT}
         if self.tools:
             required.add(ModelCapability.TOOLS)
-        if self.reasoning:
+        if self.effective_reasoning_policy.enabled:
             required.add(ModelCapability.REASONING)
         if self.stream:
             required.add(ModelCapability.STREAMING)
         if self.structured_output is not None:
             required.add(ModelCapability.STRUCTURED_OUTPUT)
         return ModelCapabilities(frozenset(required))
+
+    @property
+    def effective_reasoning_policy(self) -> ReasoningPolicy:
+        """兼容旧 `reasoning=True` 调用，同时优先使用显式策略。"""
+
+        if self.reasoning_policy.enabled or not self.reasoning:
+            return self.reasoning_policy
+        return ReasoningPolicy(mode=ReasoningMode.ADAPTIVE)
 
     @classmethod
     def from_chat_messages(
@@ -251,6 +369,8 @@ class ModelRequest:
         model: str = "",
         max_output_tokens: int = 8192,
         stream: bool = False,
+        reasoning_policy: ReasoningPolicy | None = None,
+        continuation: OpaqueContinuation | None = None,
     ) -> ModelRequest:
         return cls(
             messages=tuple(chat_message_to_model(message) for message in messages),
@@ -258,6 +378,8 @@ class ModelRequest:
             model=model,
             max_output_tokens=max_output_tokens,
             stream=stream,
+            reasoning_policy=reasoning_policy or ReasoningPolicy(),
+            continuation=continuation,
         )
 
 
@@ -286,6 +408,7 @@ class LLMResponse:
     attempts: tuple[ProviderAttempt, ...] = ()
     partial_stream: bool = False
     capabilities: tuple[str, ...] = ()
+    continuation: OpaqueContinuation | None = None
 
     @property
     def token_usage(self) -> TokenUsage:
@@ -430,6 +553,12 @@ def block_to_dict(block: ContentBlock) -> dict[str, Any]:
 
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
+    if isinstance(block, ReasoningSummaryBlock):
+        return {
+            "type": "reasoning_summary",
+            "text": block.text,
+            "kind": block.kind.value,
+        }
     if isinstance(block, ThinkingBlock):
         value: dict[str, Any] = {
             "type": "redacted_thinking" if block.redacted else "thinking",
@@ -462,6 +591,11 @@ def block_from_dict(value: Mapping[str, Any]) -> ContentBlock:
     block_type = str(value.get("type") or "")
     if block_type == "text":
         return TextBlock(str(value.get("text") or ""))
+    if block_type == "reasoning_summary":
+        return ReasoningSummaryBlock(
+            text=str(value.get("text") or ""),
+            kind=ReasoningVisibility(str(value.get("kind") or "summary")),
+        )
     if block_type in {"thinking", "redacted_thinking"}:
         return ThinkingBlock(
             thinking=str(value.get("thinking") or ""),

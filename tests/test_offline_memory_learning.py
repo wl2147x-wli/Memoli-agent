@@ -62,7 +62,10 @@ from memoli_agent.bootstrap.config import (
     RuntimeConfig,
     load_config,
 )
-from memoli_agent.bootstrap.memory import build_memory_runtime
+from memoli_agent.bootstrap.memory import (
+    build_candidate_extractor,
+    build_memory_runtime,
+)
 from memoli_agent.bootstrap.tools import build_tool_registry
 
 
@@ -192,6 +195,53 @@ detail_level = "fact"
     assert config.memory.offline.extractor.provider == "deterministic"
     assert config.memory.offline.governance.min_independent_evidence == 3
     assert config.memory.retrieval.mode == "card-first"
+
+
+def test_inline_extractor_key_is_accepted_and_redacted(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[memory]
+engine = "sqlite"
+consolidation_enabled = true
+
+[memory.offline.extractor]
+provider = "openai-compatible"
+model = "local-extractor"
+api_key = "inline-secret"
+api_key_env = ""
+base_url = "http://127.0.0.1:8000/v1"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+    extractor = build_candidate_extractor(config)
+
+    assert extractor is not None
+    assert "inline-secret" not in repr(config.memory.offline.extractor)
+    assert "inline-secret" not in repr(extractor)
+
+
+def test_memory_provider_key_sources_are_mutually_exclusive(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[memory]
+engine = "sqlite"
+consolidation_enabled = true
+
+[memory.offline.extractor]
+provider = "openai-compatible"
+model = "local-extractor"
+api_key = "inline-secret"
+api_key_env = "MEMOLI_TEST_EXTRACTOR_KEY"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="不能同时配置"):
+        build_candidate_extractor(load_config(config_file))
 
 
 def test_request_repository_is_idempotent_leased_and_recoverable(

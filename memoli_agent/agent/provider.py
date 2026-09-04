@@ -17,6 +17,8 @@ from memoli_agent.agent.llm.contracts import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    OpaqueContinuation,
+    ReasoningPolicy,
     TextBlock,
     ToolCall,
     chat_message_to_model,
@@ -35,6 +37,7 @@ from memoli_agent.agent.llm.errors import (
     UnsupportedCapabilityError,
 )
 from memoli_agent.agent.llm.openai_provider import OpenAIProvider
+from memoli_agent.agent.llm.openai_responses_provider import OpenAIResponsesProvider
 from memoli_agent.agent.llm.router import ModelRouter, ProviderTarget
 from memoli_agent.agent.types import ChatMessage
 
@@ -134,6 +137,8 @@ class ScriptedProvider:
     responses: list[LLMResponse | ProviderError]
     name: str = "scripted"
     model: str = "scripted"
+    protocol: str = "scripted"
+    dialect: str = "scripted"
     calls: list[ModelRequest] = field(default_factory=list)
     capabilities: ModelCapabilities = field(
         default_factory=lambda: ModelCapabilities(
@@ -183,6 +188,8 @@ async def invoke_provider(
     model: str = "",
     max_output_tokens: int = 8192,
     stream: bool = False,
+    reasoning_policy: ReasoningPolicy | None = None,
+    continuation: OpaqueContinuation | None = None,
     on_event: EventCallback | None = None,
 ) -> LLMResponse:
     """优先调用新合同，同时兼容只实现 `chat` 的测试 Provider。"""
@@ -201,6 +208,8 @@ async def invoke_provider(
                 model=model,
                 max_output_tokens=max_output_tokens,
                 stream=stream,
+                reasoning_policy=reasoning_policy,
+                continuation=continuation,
             ),
             on_event,
         )
@@ -223,6 +232,7 @@ __all__ = [
     "ModelResponse",
     "OpenAICompatibleProvider",
     "OpenAIProvider",
+    "OpenAIResponsesProvider",
     "PermissionProviderError",
     "ProviderError",
     "ProviderLike",

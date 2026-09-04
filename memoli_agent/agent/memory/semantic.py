@@ -77,6 +77,7 @@ class OpenAICompatibleEmbedder:
     version: str = "1"
     timeout_seconds: float = 30.0
     enabled: bool = True
+    api_key: str = field(default="", repr=False)
 
     async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         if not texts:
@@ -84,9 +85,13 @@ class OpenAICompatibleEmbedder:
         return await asyncio.to_thread(self._embed_sync, tuple(texts))
 
     def _embed_sync(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
-        api_key = os.environ.get(self.api_key_env, "").strip()
+        api_key = self.api_key.strip() or os.environ.get(
+            self.api_key_env, ""
+        ).strip()
         if not api_key:
-            raise EmbeddingError(f"环境变量 {self.api_key_env} 未配置。")
+            if self.api_key_env:
+                raise EmbeddingError(f"环境变量 {self.api_key_env} 未配置。")
+            raise EmbeddingError("Embedding API 凭据未配置。")
         payload: dict[str, Any] = {"model": self.model, "input": list(texts)}
         if self.dimensions > 0:
             payload["dimensions"] = self.dimensions

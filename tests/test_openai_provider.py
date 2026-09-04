@@ -10,11 +10,14 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
+from memoli_agent.agent.core.reasoner import Reasoner
 from memoli_agent.agent.llm.contracts import (
     ModelEvent,
     ModelEventKind,
     ModelMessage,
     ModelRequest,
+    ReasoningMode,
+    ReasoningPolicy,
     TextBlock,
     ToolResultBlock,
 )
@@ -28,6 +31,13 @@ from memoli_agent.agent.llm.errors import (
 )
 from memoli_agent.agent.llm.openai_provider import OpenAIProvider
 from memoli_agent.agent.llm.retry import RetryPolicy
+from memoli_agent.agent.plugins.events import HookKind, HookName, ModelAfterEvent
+from memoli_agent.agent.plugins.hooks import HookBus, HookRegistration
+from memoli_agent.agent.tools.base import ToolResult
+from memoli_agent.agent.tools.registry import ToolRegistry
+from memoli_agent.agent.trajectory import InMemoryTrajectoryStore
+from memoli_agent.agent.types import ChatMessage
+from memoli_agent.presentation.events import PresentationEventHub
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -379,6 +389,321 @@ def test_deepseek_dialect_uses_explicit_compatible_fields() -> None:
 
     assert seen["max_tokens"] == 123
     assert "max_completion_tokens" not in seen
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        (ReasoningPolicy(), False),
+        (ReasoningPolicy(mode=ReasoningMode.ADAPTIVE), True),
+    ],
+)
+def test_qwen_vllm_sends_explicit_thinking_switch(
+    policy: ReasoningPolicy, expected: bool
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "qwen-switch",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "最终回答"},
+                    }
+                ],
+            },
+        )
+
+    client = AsyncOpenAI(
+        api_key="unit-test-secret",
+        base_url="https://qwen.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    provider = OpenAIProvider(
+        model="qwen3", api_key="unused", dialect="qwen-vllm", client=client
+    )
+    response = _run(
+        provider.complete(
+            ModelRequest(
+                (ModelMessage("user", (TextBlock("问题"),)),),
+                reasoning_policy=policy,
+                max_output_tokens=256,
+            )
+        )
+    )
+    _run(client.close())
+
+    assert seen["max_tokens"] == 256
+    assert "max_completion_tokens" not in seen
+    assert seen["chat_template_kwargs"]["enable_thinking"] is expected
+    assert response.content == "最终回答"
+
+
+def test_qwen_vllm_nonstream_keeps_only_final_content() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "qwen-final",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "reasoning_content": "结构化秘密推理",
+                            "content": "<think>标签秘密推理</think>\n最终回答",
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = AsyncOpenAI(
+        api_key="unit-test-secret",
+        base_url="https://qwen.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    provider = OpenAIProvider(
+        model="qwen3", api_key="unused", dialect="qwen-vllm", client=client
+    )
+    events: list[ModelEvent] = []
+
+    async def on_event(event: ModelEvent) -> None:
+        events.append(event)
+
+    response = _run(
+        provider.complete(
+            ModelRequest((ModelMessage("user", (TextBlock("问题"),)),)), on_event
+        )
+    )
+    _run(client.close())
+
+    assert response.content == "最终回答"
+    assert response.message.text == "最终回答"
+    assert events[-1].text == "最终回答"
+    public = repr((response, events))
+    assert "秘密推理" not in public
+    assert "<think>" not in public
+
+
+def test_qwen_vllm_stream_buffers_cross_chunk_think_block() -> None:
+    chunks = [
+        {"content": "<thi", "reasoning_content": "结构化秘密"},
+        {"content": "nk>标签秘密"},
+        {"content": "推理</thi"},
+        {"content": "nk>\n最终回答"},
+    ]
+    payloads = []
+    for index, delta in enumerate(chunks):
+        payloads.append(
+            {
+                "id": "qwen-stream",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "qwen3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": "stop" if index == len(chunks) - 1 else None,
+                    }
+                ],
+            }
+        )
+    body = "".join(f"data: {json.dumps(item)}\n\n" for item in payloads)
+    body += "data: [DONE]\n\n"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}
+        )
+
+    client = AsyncOpenAI(
+        api_key="unit-test-secret",
+        base_url="https://qwen.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    provider = OpenAIProvider(
+        model="qwen3", api_key="unused", dialect="qwen-vllm", client=client
+    )
+    events: list[ModelEvent] = []
+
+    async def on_event(event: ModelEvent) -> None:
+        events.append(event)
+
+    response = _run(
+        provider.complete(
+            ModelRequest(
+                (ModelMessage("user", (TextBlock("问题"),)),), stream=True
+            ),
+            on_event,
+        )
+    )
+    _run(client.close())
+
+    deltas = [event.text for event in events if event.kind is ModelEventKind.TEXT_DELTA]
+    assert response.content == "最终回答"
+    assert deltas == ["最终回答"]
+    public = repr((response, events))
+    assert "秘密" not in public
+    assert "<thi" not in public
+
+
+def test_qwen_vllm_reasoner_boundaries_keep_only_final_answer_and_tools() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def sse(deltas: list[dict[str, Any]], finish_reason: str) -> str:
+        chunks = []
+        for index, delta in enumerate(deltas):
+            chunks.append(
+                {
+                    "id": f"qwen-e2e-{len(requests)}",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "qwen3",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": (
+                                finish_reason if index == len(deltas) - 1 else None
+                            ),
+                        }
+                    ],
+                }
+            )
+        return (
+            "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            + "data: [DONE]\n\n"
+        )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            body = sse(
+                [
+                    {"reasoning_content": "结构化绝密推理", "content": "<think>"},
+                    {
+                        "content": "标签绝密推理</think>",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-memory",
+                                "type": "function",
+                                "function": {
+                                    "name": "memory_probe",
+                                    "arguments": '{"query":"记忆"}',
+                                },
+                            }
+                        ],
+                    },
+                ],
+                "tool_calls",
+            )
+        else:
+            body = sse(
+                [
+                    {"content": "<think>最终前绝密"},
+                    {"content": "推理</think>\n我有记忆管理工具。"},
+                ],
+                "stop",
+            )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}
+        )
+
+    class MemoryProbe:
+        name = "memory_probe"
+        description = "检查记忆工具"
+        parameters = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+
+        async def run(self, arguments: dict[str, Any]) -> ToolResult:
+            return ToolResult(f"已检查：{arguments['query']}")
+
+    client = AsyncOpenAI(
+        api_key="unit-test-secret",
+        base_url="https://qwen.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    provider = OpenAIProvider(
+        model="qwen3", api_key="unused", dialect="qwen-vllm", client=client
+    )
+    registry = ToolRegistry()
+    registry.register(MemoryProbe())
+    trajectory = InMemoryTrajectoryStore()
+    hook_events: list[ModelAfterEvent] = []
+    hook_bus = HookBus(trajectory)
+    hook_bus.register(
+        HookRegistration(
+            "qwen-boundary-test",
+            "1.0.0",
+            "in_process",
+            HookName.MODEL_AFTER,
+            HookKind.OBSERVER,
+            lambda event: hook_events.append(event),
+            handler_name="capture-model-after",
+        )
+    )
+    presentation = PresentationEventHub()
+
+    result = _run(
+        Reasoner(
+            provider,
+            tool_registry=registry,
+            trajectory_store=trajectory,
+            hook_bus=hook_bus,
+            presentation_events=presentation,
+            stream_model=True,
+            reasoning_policy=ReasoningPolicy(mode=ReasoningMode.ADAPTIVE),
+        ).run_turn(
+            [ChatMessage("user", "你有没有记忆管理相关的工具？")],
+            session_key="qwen-e2e",
+        )
+    )
+    _run(client.close())
+
+    presentation_events = []
+    while not presentation._queue.empty():
+        presentation_events.append(_run(presentation.consume()))
+    public_boundaries = repr(
+        (
+            result,
+            hook_events,
+            trajectory.event_payloads,
+            trajectory.traces,
+            trajectory.spans,
+            presentation_events,
+            requests[1]["messages"],
+        )
+    )
+    assert result.response.content == "我有记忆管理工具。"
+    assert requests[0]["chat_template_kwargs"]["enable_thinking"] is True
+    assert requests[1]["messages"][-1]["role"] == "tool"
+    assert [event.content for event in hook_events] == ["", "我有记忆管理工具。"]
+    assert "我有记忆管理工具。" in public_boundaries
+    assert "绝密推理" not in public_boundaries
+    assert "<think>" not in public_boundaries
+    assert "</think>" not in public_boundaries
 
 
 @pytest.mark.parametrize("failure_kind", ["network", "timeout"])

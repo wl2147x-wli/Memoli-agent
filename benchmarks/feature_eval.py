@@ -26,6 +26,7 @@ from memoli_agent.agent.memory.hybrid import (  # noqa: E402
 from memoli_agent.agent.memory.layered import LayeredMemoryRetriever  # noqa: E402
 from memoli_agent.agent.memory.models import (  # noqa: E402
     EvidenceRef,
+    GovernanceDecision,
     MemoryMutation,
     MemoryQuery,
     MemoryScope,
@@ -245,7 +246,21 @@ def c8(h: Harness):
     # 对不存在 job 记录决策应抛 KeyError
     decision_guarded = False
     try:
-        h.store.record_governance_decision("job_missing", "approve", "governor", "t")
+        h.store.record_governance_decision(
+            "job_missing",
+            GovernanceDecision(
+                candidate_id="cand_missing",
+                expected_revision=0,
+                decision="approve",
+                reason_codes=("benchmark-guard",),
+                confidence=1.0,
+                governor_version="governor",
+                prompt_version="t",
+                policy_version="1",
+            ),
+            actor="benchmark",
+            outcome="approved",
+        )
     except Exception as e:
         decision_guarded = True
         problems.append(f"decision_missing_job_guarded: {type(e).__name__}")

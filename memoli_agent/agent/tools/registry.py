@@ -106,7 +106,11 @@ class ToolRegistry:
         return self._purposes.get(name, tool_purpose(name))
 
     def get_schemas(
-        self, *, session_key: str = "", conversation_epoch: int = 0
+        self,
+        *,
+        session_key: str = "",
+        conversation_epoch: int = 0,
+        capability_revision: int | None = None,
     ) -> list[dict[str, Any]]:
         """返回 OpenAI-compatible tools schema。"""
 
@@ -120,7 +124,7 @@ class ToolRegistry:
             and self.disclosure_repository is not None
         ):
             disclosed = self.disclosure_repository.list_tool_disclosures(
-                session_key, conversation_epoch
+                session_key, conversation_epoch, capability_revision
             )
             schemas.extend(json.loads(item.schema_json) for item in disclosed)
         return schemas
@@ -165,9 +169,16 @@ class ToolRegistry:
         """执行指定工具。"""
 
         tool = self._tools.get(name)
-        if tool is not None and self._progressive_disclosure:
-            visible_names = self._base_tool_names | (
-                set(context.allowed_tool_names) if context is not None else set()
+        if (
+            tool is not None
+            and context is not None
+            and context.allowed_tool_names is not None
+            and name not in context.allowed_tool_names
+        ):
+            tool = None
+        elif tool is not None and self._progressive_disclosure:
+            visible_names = self._base_tool_names | set(
+                context.allowed_tool_names or () if context is not None else ()
             )
             if name not in visible_names:
                 tool = None

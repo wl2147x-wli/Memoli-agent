@@ -3,6 +3,7 @@
 ## Purpose
 
 定义 Memoli 从配置加载、组件装配、消息接入、会话管理到模型推理和生成回复的核心运行行为，以及远程模型失败和应用关闭时必须保持的边界。
+
 ## Requirements
 
 ### Requirement: Default-startable configuration
@@ -690,3 +691,25 @@ Runtime SHALL 为 `memory-governor` 同时选择一致的非持久 Trajectory、
 - **WHEN** research、coding 或 general SubAgent 执行普通委派任务
 - **THEN** 其既有轨迹与插件策略行为 SHALL 保持不变
 - **AND** memory-governor 的隔离配置 SHALL NOT 全局关闭主 Agent 或普通 SubAgent Hook
+
+### Requirement: Turn-bound capability activation
+
+Runtime SHALL 在新用户 turn 的模型调用前自动协调当前有效能力，并在该 turn 的整个 Provider 工具循环中固定同一个能力快照 revision；普通能力变化 SHALL 不清除会话历史，安全撤销 SHALL 保持立即拒绝语义。
+
+#### Scenario: A configured tool is enabled between turns
+
+- **WHEN** 某工具在上一 turn 后启用且新 turn 开始时已成功注册
+- **THEN** 新 turn 的首个模型请求 SHALL 包含该工具的当前 schema
+- **AND** 用户 SHALL NOT 需要重启、执行 `/clear` 或猜测旧快照状态
+
+#### Scenario: A configured tool is removed between turns
+
+- **WHEN** 某工具在上一 turn 后被禁用或不再成功注册
+- **THEN** 新 turn 的模型请求 SHALL NOT 继续声明该工具可用
+- **AND** 工具执行层 SHALL 继续拒绝任何不属于该 turn 冻结 revision 的调用
+
+#### Scenario: Capability changes during a tool loop
+
+- **WHEN** 模型已经在当前 turn 中产生工具调用，随后 Runtime 的普通能力集合发生变化
+- **THEN** 工具结果续接及当前 turn 后续模型请求 SHALL 继续使用 turn 开始时冻结的 revision
+- **AND** 变化 SHALL 在下一 turn 生效，不得破坏现有 tool call/result 关联

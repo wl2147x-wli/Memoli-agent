@@ -15,11 +15,18 @@ from memoli_agent.agent.context_management import (
     ContextCompilerSettings,
     ContextStateError,
     InMemoryContextStateRepository,
+    SQLiteContextStateRepository,
     TaskAwareCompactor,
 )
 from memoli_agent.agent.core.reasoner import Reasoner
 from memoli_agent.agent.core.results import TerminationReason, TurnResult
-from memoli_agent.agent.llm.contracts import ModelCapabilities, ModelRequest
+from memoli_agent.agent.llm.contracts import (
+    ModelCapabilities,
+    ModelRequest,
+    OpaqueContinuation,
+    ReasoningMode,
+    ReasoningPolicy,
+)
 from memoli_agent.agent.provider import (
     LLMResponse,
     ProviderError,
@@ -259,6 +266,66 @@ def test_two_tool_rounds_complete_and_preserve_model_context() -> None:
     assert store.events[-1].event_type == "trace_finished"
 
 
+def test_reasoner_carries_frozen_policy_and_continuation_only_within_turn() -> None:
+    policy = ReasoningPolicy(ReasoningMode.ADAPTIVE, "high")
+    continuation = OpaqueContinuation(
+        "scripted",
+        items=({"type": "reasoning", "encrypted_content": "private"},),
+        reasoning_policy=policy,
+    )
+
+    @dataclass
+    class CompleteProvider:
+        responses: list[LLMResponse]
+        name: str = "scripted"
+        protocol: str = "scripted"
+        capabilities: ModelCapabilities = field(
+            default_factory=lambda: ModelCapabilities.from_strings(
+                ["text", "tools", "reasoning"]
+            )
+        )
+        calls: list[ModelRequest] = field(default_factory=list)
+
+        async def complete(self, request: ModelRequest, on_event=None):  # type: ignore[no-untyped-def]
+            self.calls.append(request)
+            return self.responses.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    provider = CompleteProvider(
+        [
+            LLMResponse(
+                "",
+                [ToolCall("first", {}, "call-1")],
+                provider="scripted",
+                protocol="scripted",
+                continuation=continuation,
+            ),
+            LLMResponse("done", provider="scripted", protocol="scripted"),
+            LLMResponse("next", provider="scripted", protocol="scripted"),
+        ]
+    )
+    store = InMemoryTrajectoryStore()
+    reasoner = Reasoner(
+        provider,
+        tool_registry=make_registry(RecordingTool("first")),
+        reasoning_policy=policy,
+        trajectory_store=store,
+    )
+
+    first = run(reasoner.run_turn([ChatMessage("user", "go")], session_key="s"))
+    second = run(reasoner.run_turn([ChatMessage("user", "next")], session_key="s"))
+
+    assert first.response.content == "done"
+    assert second.response.content == "next"
+    assert provider.calls[0].effective_reasoning_policy == policy
+    assert provider.calls[1].continuation is continuation
+    assert provider.calls[1].effective_reasoning_policy == policy
+    assert provider.calls[2].continuation is None
+    assert "private" not in repr(store.event_payloads)
+
+
 def test_tool_search_disclosure_reaches_next_provider_request() -> None:
     repository = InMemoryContextStateRepository()
     registry = ToolRegistry(disclosure_repository=repository)
@@ -303,6 +370,127 @@ def test_tool_search_disclosure_reaches_next_provider_request() -> None:
     assert first_names == {"tool_search"}
     assert second_names == {"tool_search", "weather_lookup"}
     assert weather.calls == [{}]
+
+
+def test_new_tool_activates_next_turn_without_clear_and_stays_pinned() -> None:
+    repository = InMemoryContextStateRepository()
+    registry = ToolRegistry()
+    recall = RecordingTool("memory_recall")
+    registry.register(recall)
+    provider = ScriptedProvider(
+        [
+            LLMResponse("first-answer"),
+            LLMResponse(
+                "", [ToolCall("memory_manage", {"value": 1}, "manage-call")]
+            ),
+            LLMResponse("managed"),
+        ]
+    )
+    compiler = ContextCompiler(
+        repository,
+        ConservativeTokenEstimator(),
+        ContextCompilerSettings(32_000, 2_000, 1_000, compaction_enabled=False),
+    )
+    reasoner = Reasoner(
+        provider,
+        tool_registry=registry,
+        trajectory_store=InMemoryTrajectoryStore(),
+        context_compiler=compiler,
+    )
+    first_messages = [
+        ChatMessage("system", "system"),
+        ChatMessage("user", "first"),
+    ]
+    first = run(reasoner.run_turn(first_messages, session_key="s"))
+    manage = RecordingTool("memory_manage")
+    registry.register(manage)
+    second = run(
+        reasoner.run_turn(
+            [
+                *first_messages,
+                ChatMessage("assistant", first.response.content),
+                ChatMessage("user", "manage memory"),
+            ],
+            session_key="s",
+        )
+    )
+
+    sent_names = [
+        {item["function"]["name"] for item in schemas}
+        for schemas in provider.tool_schemas
+    ]
+    assert sent_names == [
+        {"memory_recall"},
+        {"memory_manage", "memory_recall"},
+        {"memory_manage", "memory_recall"},
+    ]
+    assert first.response.content == "first-answer"
+    assert second.response.content == "managed"
+    assert manage.calls == [{"value": 1}]
+    assert repository.get_snapshot("s", 1, 1) is not None
+    assert repository.get_snapshot("s", 1, 2) is not None
+
+
+def test_persistent_restart_activates_memory_manage_without_clear(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "context-state.db"
+    first_repository = SQLiteContextStateRepository(database)
+    first_provider = ScriptedProvider([LLMResponse("first-answer")])
+    first_registry = make_registry(RecordingTool("memory_recall"))
+    settings = ContextCompilerSettings(
+        32_000, 2_000, 1_000, compaction_enabled=False
+    )
+    first_reasoner = Reasoner(
+        first_provider,
+        tool_registry=first_registry,
+        trajectory_store=InMemoryTrajectoryStore(),
+        context_compiler=ContextCompiler(
+            first_repository, ConservativeTokenEstimator(), settings
+        ),
+    )
+    history = [ChatMessage("system", "system"), ChatMessage("user", "first")]
+    first = run(first_reasoner.run_turn(history, session_key="cli:local"))
+    first_repository.close()
+
+    second_repository = SQLiteContextStateRepository(database)
+    manage = RecordingTool("memory_manage")
+    second_registry = make_registry(RecordingTool("memory_recall"), manage)
+    second_provider = ScriptedProvider(
+        [
+            LLMResponse(
+                "", [ToolCall("memory_manage", {"value": 7}, "manage-call")]
+            ),
+            LLMResponse("managed"),
+        ]
+    )
+    second_reasoner = Reasoner(
+        second_provider,
+        tool_registry=second_registry,
+        trajectory_store=InMemoryTrajectoryStore(),
+        context_compiler=ContextCompiler(
+            second_repository, ConservativeTokenEstimator(), settings
+        ),
+    )
+    second = run(
+        second_reasoner.run_turn(
+            [
+                *history,
+                ChatMessage("assistant", first.response.content),
+                ChatMessage("user", "use memory manage"),
+            ],
+            session_key="cli:local",
+        )
+    )
+
+    assert second.response.content == "managed"
+    assert manage.calls == [{"value": 7}]
+    assert {
+        item["function"]["name"] for item in second_provider.tool_schemas[0]
+    } == {"memory_recall", "memory_manage"}
+    assert second_repository.get_snapshot("cli:local", 1, 1) is not None
+    assert second_repository.get_snapshot("cli:local", 1, 2) is not None
+    second_repository.close()
 
 
 def test_two_tool_rounds_persist_complete_sqlite_hierarchy(tmp_path: Path) -> None:

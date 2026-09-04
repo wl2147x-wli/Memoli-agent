@@ -22,7 +22,7 @@ from memoli_agent.agent.context_management.models import (
 # 列与 coverage/outbox 表；旧 v1 DB 经 _migrate_v1_to_v2 additive 升级，不删数据。
 # §7.1：v3 把 snapshots 主键迁移到 (session_key, conversation_epoch)。
 # §7.4：v4 给 previews 加 visible 列（派生索引 epoch 清理/不可见状态）。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class ContextStateError(RuntimeError):
@@ -33,19 +33,20 @@ class ContextStateRepository(Protocol):
     def close(self) -> None: ...
 
     def get_snapshot(
-        self, session_key: str, epoch: int = 0
+        self, session_key: str, epoch: int = 0, revision: int | None = None
     ) -> ContextSnapshot | None: ...
 
-    def save_snapshot(self, snapshot: ContextSnapshot) -> None: ...
+    def save_snapshot(self, snapshot: ContextSnapshot) -> ContextSnapshot: ...
 
     def invalidate_snapshot(
-        self, session_key: str, reason: str, epoch: int = 0
+        self, session_key: str, reason: str, epoch: int = 0,
+        revision: int | None = None,
     ) -> None: ...
 
     def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure: ...
 
     def list_tool_disclosures(
-        self, session_key: str, epoch: int
+        self, session_key: str, epoch: int, revision: int | None = None
     ) -> tuple[ToolDisclosure, ...]: ...
 
     def list_archives(self, session_key: str) -> tuple[ContextArchive, ...]: ...
@@ -145,7 +146,7 @@ class InMemoryContextStateRepository:
     """Non-persistent state; intentionally starts empty after process restart."""
 
     def __init__(self) -> None:
-        self.snapshots: dict[tuple[str, int], ContextSnapshot] = {}
+        self.snapshots: dict[tuple[str, int, int], ContextSnapshot] = {}
         self.archives: dict[str, list[ContextArchive]] = {}
         # §6.1 coverage 行：{archive_id, source_ref, superseded_by}（''=活动）。
         # superseded_by 非空 = 被该 archive 取代后留存审计（design §5 line 104）。
@@ -153,7 +154,7 @@ class InMemoryContextStateRepository:
         # §6.1 outbox 行（结构对等；投递由 §6.6 实现）。
         self.outbox: dict[str, list[dict[str, object]]] = {}
         self.previews: dict[str, FrozenToolPreview] = {}
-        self.tool_disclosures: dict[tuple[str, int], list[ToolDisclosure]] = {}
+        self.tool_disclosures: dict[tuple[str, int, int], list[ToolDisclosure]] = {}
         # §7.4 不可见预览派生索引：epoch 清理时把旧 epoch 预览标记不可见（不删，
         # 保留审计/可重建），get_preview_by_ref 据此过滤，不注入新 epoch 上下文。
         self.invisible_previews: set[str] = set()
@@ -165,32 +166,54 @@ class InMemoryContextStateRepository:
         return None
 
     def get_snapshot(
-        self, session_key: str, epoch: int = 0
+        self, session_key: str, epoch: int = 0, revision: int | None = None
     ) -> ContextSnapshot | None:
         with self._lock:
-            return self.snapshots.get((session_key, epoch))
+            if revision is not None:
+                return self.snapshots.get((session_key, epoch, revision))
+            matches = [
+                snapshot
+                for (key, item_epoch, _), snapshot in self.snapshots.items()
+                if key == session_key and item_epoch == epoch
+            ]
+            return max(matches, key=lambda item: item.capability_revision, default=None)
 
-    def save_snapshot(self, snapshot: ContextSnapshot) -> None:
+    def save_snapshot(self, snapshot: ContextSnapshot) -> ContextSnapshot:
         with self._lock:
-            # §7.1 (session_key, epoch) 维度复用：同 epoch 已冻结则不覆盖
-            # （字节级稳定前缀，spec「Runtime state changes during an epoch」）。
-            self.snapshots.setdefault(
-                (snapshot.session_key, snapshot.conversation_epoch), snapshot
+            latest = self.get_snapshot(
+                snapshot.session_key, snapshot.conversation_epoch
             )
+            if (
+                latest is not None
+                and not latest.invalidated_reason
+                and latest.stable_prefix_hash == snapshot.stable_prefix_hash
+            ):
+                return latest
+            revision = latest.capability_revision + 1 if latest is not None else 1
+            committed = replace(snapshot, capability_revision=revision)
+            key = (committed.session_key, committed.conversation_epoch, revision)
+            self.snapshots[key] = committed
+            return committed
 
     def invalidate_snapshot(
-        self, session_key: str, reason: str, epoch: int = 0
+        self, session_key: str, reason: str, epoch: int = 0,
+        revision: int | None = None,
     ) -> None:
         with self._lock:
-            current = self.snapshots.get((session_key, epoch))
+            current = self.get_snapshot(session_key, epoch, revision)
             if current is not None and not current.invalidated_reason:
-                self.snapshots[(session_key, epoch)] = replace(
+                key = (session_key, epoch, current.capability_revision)
+                self.snapshots[key] = replace(
                     current, invalidated_reason=reason[:512]
                 )
 
     def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure:
         with self._lock:
-            key = (disclosure.session_key, disclosure.conversation_epoch)
+            key = (
+                disclosure.session_key,
+                disclosure.conversation_epoch,
+                disclosure.capability_revision,
+            )
             items = self.tool_disclosures.setdefault(key, [])
             existing = next(
                 (item for item in items if item.tool_name == disclosure.tool_name),
@@ -199,7 +222,7 @@ class InMemoryContextStateRepository:
             if existing is not None:
                 if existing.schema_hash != disclosure.schema_hash:
                     raise ContextStateError(
-                        "disclosed tool schema changed within epoch"
+                        "disclosed tool schema changed within capability revision"
                     )
                 return existing
             committed = replace(disclosure, sequence=len(items) + 1)
@@ -207,10 +230,14 @@ class InMemoryContextStateRepository:
             return committed
 
     def list_tool_disclosures(
-        self, session_key: str, epoch: int
+        self, session_key: str, epoch: int, revision: int | None = None
     ) -> tuple[ToolDisclosure, ...]:
         with self._lock:
-            return tuple(self.tool_disclosures.get((session_key, epoch), ()))
+            selected = revision
+            if selected is None:
+                snapshot = self.get_snapshot(session_key, epoch)
+                selected = snapshot.capability_revision if snapshot is not None else 1
+            return tuple(self.tool_disclosures.get((session_key, epoch, selected), ()))
 
     def list_archives(self, session_key: str) -> tuple[ContextArchive, ...]:
         with self._lock:
@@ -538,8 +565,8 @@ class InMemoryContextStateRepository:
             # §7.1 snapshots 以 (session_key, epoch) 为键；/clear 重置派生状态
             # 时清掉该会话全部 epoch 的快照（新 epoch 将重新冻结）。
             self.snapshots = {
-                (sk, ep): snap
-                for (sk, ep), snap in self.snapshots.items()
+                (sk, ep, revision): snap
+                for (sk, ep, revision), snap in self.snapshots.items()
                 if sk != session_key
             }
             self.archives.pop(session_key, None)
@@ -574,6 +601,9 @@ class SQLiteContextStateRepository:
 
     def _initialize(self) -> None:
         with self._lock, self._connection:
+            # SQLite DDL 在隐式事务开始前可能直接持久化；显式事务保证 clone-copy-
+            # rename 迁移任一步失败时 schema 与版本整体回滚。
+            self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_info "
                 "(component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
@@ -584,7 +614,7 @@ class SQLiteContextStateRepository:
             current = int(row["version"]) if row is not None else None
             if current is None:
                 # 全新 DB：直接建当前 schema
-                self._create_v5_schema()
+                self._create_v6_schema()
                 self._connection.execute(
                     "INSERT OR IGNORE INTO schema_info VALUES ('context-state', ?)",
                     (SCHEMA_VERSION,),
@@ -597,6 +627,7 @@ class SQLiteContextStateRepository:
                 # §7.4 v3→v4 链式：previews 加 visible 列
                 self._migrate_v3_to_v4()
                 self._migrate_v4_to_v5()
+                self._migrate_v5_to_v6()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -608,6 +639,7 @@ class SQLiteContextStateRepository:
                 # §7.4 v3→v4 链式：previews 加 visible 列
                 self._migrate_v3_to_v4()
                 self._migrate_v4_to_v5()
+                self._migrate_v5_to_v6()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -617,6 +649,7 @@ class SQLiteContextStateRepository:
                 # §7.4 v3→v4：previews 加 visible 列（派生索引 epoch 清理/不可见）
                 self._migrate_v3_to_v4()
                 self._migrate_v4_to_v5()
+                self._migrate_v5_to_v6()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -624,6 +657,14 @@ class SQLiteContextStateRepository:
                 )
             elif current == 4:
                 self._migrate_v4_to_v5()
+                self._migrate_v5_to_v6()
+                self._connection.execute(
+                    "UPDATE schema_info SET version=? "
+                    "WHERE component='context-state'",
+                    (SCHEMA_VERSION,),
+                )
+            elif current == 5:
+                self._migrate_v5_to_v6()
                 self._connection.execute(
                     "UPDATE schema_info SET version=? "
                     "WHERE component='context-state'",
@@ -634,7 +675,7 @@ class SQLiteContextStateRepository:
                     f"context-state schema {current} is not supported"
                 )
 
-    def _create_v5_schema(self) -> None:
+    def _create_v6_schema(self) -> None:
         # archives：epoch/level/status/coverage_hash/parent_archive_refs 为真实列
         # （供 list_frontier 索引与 coverage 活动非重叠 partial UNIQUE），data 仍存
         # 完整 ContextArchive JSON（重建权威，列为其查询镜像）。
@@ -644,8 +685,9 @@ class SQLiteContextStateRepository:
             CREATE TABLE IF NOT EXISTS snapshots (
                 session_key TEXT NOT NULL,
                 conversation_epoch INTEGER NOT NULL DEFAULT 0,
+                capability_revision INTEGER NOT NULL DEFAULT 1,
                 data TEXT NOT NULL,
-                PRIMARY KEY(session_key, conversation_epoch)
+                PRIMARY KEY(session_key, conversation_epoch, capability_revision)
             );
             CREATE TABLE IF NOT EXISTS archives (
                 archive_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
@@ -672,12 +714,13 @@ class SQLiteContextStateRepository:
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_key TEXT NOT NULL,
                 conversation_epoch INTEGER NOT NULL,
+                capability_revision INTEGER NOT NULL DEFAULT 1,
                 tool_name TEXT NOT NULL,
                 schema_json TEXT NOT NULL,
                 schema_hash TEXT NOT NULL,
                 tool_call_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(session_key, conversation_epoch, tool_name)
+                UNIQUE(session_key, conversation_epoch, capability_revision, tool_name)
             );
             CREATE TABLE IF NOT EXISTS session_state (
                 session_key TEXT PRIMARY KEY, compaction_failures INTEGER NOT NULL,
@@ -837,38 +880,126 @@ class SQLiteContextStateRepository:
             "UNIQUE(session_key, conversation_epoch, tool_name))"
         )
 
+    def _migrate_v5_to_v6(self) -> None:
+        """v5→v6：快照与工具披露增加不可变 capability revision。"""
+
+        conn = self._connection
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots ("
+            "session_key TEXT NOT NULL, conversation_epoch INTEGER NOT NULL DEFAULT 0, "
+            "data TEXT NOT NULL, PRIMARY KEY(session_key, conversation_epoch))"
+        )
+        conn.execute(
+            "CREATE TABLE snapshots_v6 ("
+            "session_key TEXT NOT NULL, conversation_epoch INTEGER NOT NULL, "
+            "capability_revision INTEGER NOT NULL, data TEXT NOT NULL, "
+            "PRIMARY KEY(session_key, conversation_epoch, capability_revision))"
+        )
+        conn.execute(
+            "INSERT INTO snapshots_v6 "
+            "(session_key, conversation_epoch, capability_revision, data) "
+            "SELECT session_key, conversation_epoch, 1, "
+            "json_set(data, '$.capability_revision', 1) FROM snapshots"
+        )
+        conn.execute("DROP TABLE snapshots")
+        conn.execute("ALTER TABLE snapshots_v6 RENAME TO snapshots")
+        conn.execute(
+            "CREATE TABLE tool_disclosures_v6 ("
+            "sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_key TEXT NOT NULL, conversation_epoch INTEGER NOT NULL, "
+            "capability_revision INTEGER NOT NULL, tool_name TEXT NOT NULL, "
+            "schema_json TEXT NOT NULL, schema_hash TEXT NOT NULL, "
+            "tool_call_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "UNIQUE(session_key, conversation_epoch, capability_revision, tool_name))"
+        )
+        conn.execute(
+            "INSERT INTO tool_disclosures_v6 "
+            "(sequence, session_key, conversation_epoch, capability_revision, "
+            "tool_name, schema_json, schema_hash, tool_call_id, created_at) "
+            "SELECT sequence, session_key, conversation_epoch, 1, tool_name, "
+            "schema_json, schema_hash, tool_call_id, created_at "
+            "FROM tool_disclosures"
+        )
+        conn.execute("DROP TABLE tool_disclosures")
+        conn.execute(
+            "ALTER TABLE tool_disclosures_v6 RENAME TO tool_disclosures"
+        )
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
 
     def get_snapshot(
-        self, session_key: str, epoch: int = 0
+        self, session_key: str, epoch: int = 0, revision: int | None = None
     ) -> ContextSnapshot | None:
-        row = self._one(
-            "SELECT data FROM snapshots "
-            "WHERE session_key=? AND conversation_epoch=?",
-            session_key,
-            epoch,
-        )
+        if revision is None:
+            row = self._one(
+                "SELECT data FROM snapshots WHERE session_key=? "
+                "AND conversation_epoch=? ORDER BY capability_revision DESC LIMIT 1",
+                session_key,
+                epoch,
+            )
+        else:
+            row = self._one(
+                "SELECT data FROM snapshots WHERE session_key=? "
+                "AND conversation_epoch=? AND capability_revision=?",
+                session_key,
+                epoch,
+                revision,
+            )
         return ContextSnapshot(**json.loads(row["data"])) if row else None
 
-    def save_snapshot(self, snapshot: ContextSnapshot) -> None:
-        self._execute(
-            "INSERT OR IGNORE INTO snapshots VALUES (?, ?, ?)",
-            snapshot.session_key,
-            snapshot.conversation_epoch,
-            _json(asdict(snapshot)),
-        )
+    def save_snapshot(self, snapshot: ContextSnapshot) -> ContextSnapshot:
+        try:
+            with self._lock, self._connection:
+                row = self._connection.execute(
+                    "SELECT data FROM snapshots WHERE session_key=? "
+                    "AND conversation_epoch=? "
+                    "ORDER BY capability_revision DESC LIMIT 1",
+                    (snapshot.session_key, snapshot.conversation_epoch),
+                ).fetchone()
+                latest = ContextSnapshot(**json.loads(row["data"])) if row else None
+                if (
+                    latest is not None
+                    and not latest.invalidated_reason
+                    and latest.stable_prefix_hash == snapshot.stable_prefix_hash
+                ):
+                    return latest
+                revision = latest.capability_revision + 1 if latest is not None else 1
+                committed = replace(snapshot, capability_revision=revision)
+                self._connection.execute(
+                    "INSERT INTO snapshots "
+                    "(session_key, conversation_epoch, capability_revision, data) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        committed.session_key,
+                        committed.conversation_epoch,
+                        revision,
+                        _json(asdict(committed)),
+                    ),
+                )
+                return committed
+        except sqlite3.DatabaseError as exc:
+            raise ContextStateError(type(exc).__name__) from exc
 
     def invalidate_snapshot(
-        self, session_key: str, reason: str, epoch: int = 0
+        self, session_key: str, reason: str, epoch: int = 0,
+        revision: int | None = None,
     ) -> None:
         with self._lock, self._connection:
-            row = self._connection.execute(
-                "SELECT data FROM snapshots "
-                "WHERE session_key=? AND conversation_epoch=?",
-                (session_key, epoch),
-            ).fetchone()
+            if revision is None:
+                row = self._connection.execute(
+                    "SELECT data FROM snapshots WHERE session_key=? "
+                    "AND conversation_epoch=? "
+                    "ORDER BY capability_revision DESC LIMIT 1",
+                    (session_key, epoch),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    "SELECT data FROM snapshots WHERE session_key=? "
+                    "AND conversation_epoch=? AND capability_revision=?",
+                    (session_key, epoch, revision),
+                ).fetchone()
             if row is None:
                 return
             snapshot = ContextSnapshot(**json.loads(row["data"]))
@@ -877,8 +1008,14 @@ class SQLiteContextStateRepository:
             invalidated = replace(snapshot, invalidated_reason=reason[:512])
             self._connection.execute(
                 "UPDATE snapshots SET data=? "
-                "WHERE session_key=? AND conversation_epoch=?",
-                (_json(asdict(invalidated)), session_key, epoch),
+                "WHERE session_key=? AND conversation_epoch=? "
+                "AND capability_revision=?",
+                (
+                    _json(asdict(invalidated)),
+                    session_key,
+                    epoch,
+                    snapshot.capability_revision,
+                ),
             )
 
     def save_tool_disclosure(self, disclosure: ToolDisclosure) -> ToolDisclosure:
@@ -886,12 +1023,14 @@ class SQLiteContextStateRepository:
             with self._lock, self._connection:
                 self._connection.execute(
                     "INSERT OR IGNORE INTO tool_disclosures "
-                    "(session_key, conversation_epoch, tool_name, schema_json, "
+                    "(session_key, conversation_epoch, capability_revision, "
+                    "tool_name, schema_json, "
                     "schema_hash, tool_call_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         disclosure.session_key,
                         disclosure.conversation_epoch,
+                        disclosure.capability_revision,
                         disclosure.tool_name,
                         disclosure.schema_json,
                         disclosure.schema_hash,
@@ -900,13 +1039,16 @@ class SQLiteContextStateRepository:
                     ),
                 )
                 row = self._connection.execute(
-                    "SELECT sequence, session_key, conversation_epoch, tool_name, "
+                    "SELECT sequence, session_key, conversation_epoch, "
+                    "capability_revision, tool_name, "
                     "schema_json, schema_hash, tool_call_id, created_at "
                     "FROM tool_disclosures WHERE session_key=? "
-                    "AND conversation_epoch=? AND tool_name=?",
+                    "AND conversation_epoch=? AND capability_revision=? "
+                    "AND tool_name=?",
                     (
                         disclosure.session_key,
                         disclosure.conversation_epoch,
+                        disclosure.capability_revision,
                         disclosure.tool_name,
                     ),
                 ).fetchone()
@@ -914,22 +1056,28 @@ class SQLiteContextStateRepository:
                 committed = _tool_disclosure_from_row(row)
                 if committed.schema_hash != disclosure.schema_hash:
                     raise ContextStateError(
-                        "disclosed tool schema changed within epoch"
+                        "disclosed tool schema changed within capability revision"
                     )
                 return committed
         except sqlite3.DatabaseError as exc:
             raise ContextStateError(type(exc).__name__) from exc
 
     def list_tool_disclosures(
-        self, session_key: str, epoch: int
+        self, session_key: str, epoch: int, revision: int | None = None
     ) -> tuple[ToolDisclosure, ...]:
+        selected = revision
+        if selected is None:
+            snapshot = self.get_snapshot(session_key, epoch)
+            selected = snapshot.capability_revision if snapshot is not None else 1
         with self._lock:
             rows = self._connection.execute(
-                "SELECT sequence, session_key, conversation_epoch, tool_name, "
+                "SELECT sequence, session_key, conversation_epoch, "
+                "capability_revision, tool_name, "
                 "schema_json, schema_hash, tool_call_id, created_at "
                 "FROM tool_disclosures WHERE session_key=? AND conversation_epoch=? "
+                "AND capability_revision=? "
                 "ORDER BY sequence, tool_name",
-                (session_key, epoch),
+                (session_key, epoch, selected),
             ).fetchall()
         return tuple(_tool_disclosure_from_row(row) for row in rows)
 
@@ -1382,6 +1530,7 @@ def _tool_disclosure_from_row(row: sqlite3.Row) -> ToolDisclosure:
         tool_call_id=str(row["tool_call_id"]),
         created_at=str(row["created_at"]),
         sequence=int(row["sequence"]),
+        capability_revision=int(row["capability_revision"]),
     )
 
 

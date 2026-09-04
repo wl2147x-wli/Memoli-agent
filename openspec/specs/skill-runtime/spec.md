@@ -1,7 +1,7 @@
 # skill-runtime Specification
 
 ## Purpose
-TBD - created by archiving change build-versioned-skill-runtime. Update Purpose after archive.
+定义版本化 Skill 包的校验、注册、选择、加载和运行时隔离边界，确保模型只能使用经过批准且来源可追踪的技能内容，并支持安全升级、回退和审计。
 ## Requirements
 ### Requirement: Validated Skill package contract
 

@@ -25,7 +25,7 @@ class ChatMessage:
     blocks: tuple[dict[str, Any], ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为 OpenAI-compatible messages 字典。"""
+        """转换为可持久化的规范化消息字典，并排除 Provider 私有状态。"""
 
         message: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_call_id is not None:
@@ -34,7 +34,33 @@ class ChatMessage:
             message["name"] = self.name
         if self.tool_calls is not None:
             message["tool_calls"] = self.tool_calls
+        portable_blocks = _portable_blocks(self.blocks)
+        if portable_blocks:
+            message["blocks"] = portable_blocks
         return message
+
+
+def _portable_blocks(
+    blocks: tuple[dict[str, Any], ...] | None,
+) -> list[dict[str, Any]]:
+    """仅保留可移植语义块；旧式思考块和私有协议字段一律丢弃。"""
+
+    result: list[dict[str, Any]] = []
+    private_keys = {
+        "signature",
+        "opaque",
+        "data",
+        "encrypted_content",
+        "response_id",
+        "previous_response_id",
+    }
+    for block in blocks or ():
+        if str(block.get("type") or "") in {"thinking", "redacted_thinking"}:
+            continue
+        result.append(
+            {key: value for key, value in block.items() if key not in private_keys}
+        )
+    return result
 
 
 @dataclass(frozen=True, slots=True)

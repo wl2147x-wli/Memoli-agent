@@ -76,3 +76,7 @@ class ResponseProtocolError(ProviderError):
 
 class UnsupportedCapabilityError(ProviderError):
     error_type = "unsupported-capability"
+
+
+class UnsupportedReasoningPolicyError(ProviderError):
+    error_type = "unsupported-reasoning-policy"

@@ -38,7 +38,9 @@ Skill Runtime 关闭时，默认模型可见集合由配置和运行环境决定
 改写为替代工具。历史轨迹和归档文档中的旧名称作为审计记录保留。
 
 工具数量很小时不启用主动发现，`tool_search_enabled` 默认关闭，此时全部启用工具按
-名称稳定排序并进入完整 schema snapshot。启用后，基础工具与 `tool_search` 先组成
+名称稳定排序并进入完整 capability revision。工具配置在 turn 之间变化时，下一 turn
+自动创建新 revision；同一工具循环仍固定原 schema，不需要通过 `/clear` 刷新能力。
+启用后，基础工具与 `tool_search` 先组成
 稳定前缀；后续插件、MCP 或其他延迟注册工具由 `tool_search` 返回有界、确定性候选，
 仅选中的完整 schema 会写入 `(session_key, conversation_epoch)` 披露账本。下一次
 Provider 请求由 Context Compiler 在原稳定前缀后按首次披露顺序追加这些 schema；

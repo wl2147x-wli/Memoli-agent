@@ -150,6 +150,91 @@ def test_recompile_with_same_inputs_is_hash_idempotent() -> None:
     assert first.context_hash == second.context_hash
 
 
+def test_capability_change_creates_revision_but_pin_stays_stable() -> None:
+    compiler, repo = _compiler()
+    first = compiler.compile(
+        session_key="s",
+        session_instance_id="old-process",
+        messages=[_SYSTEM, ChatMessage("user", "first")],
+        tools=[_SCHEMA],
+    )
+    added = {
+        "type": "function",
+        "function": {"name": "memory_manage", "parameters": {"type": "object"}},
+    }
+    pinned = compiler.compile(
+        session_key="s",
+        session_instance_id="old-process",
+        messages=[_SYSTEM, ChatMessage("user", "same turn")],
+        tools=[_SCHEMA, added],
+        capability_revision=first.capability_revision,
+    )
+    later = compiler.compile(
+        session_key="s",
+        session_instance_id="new-process",
+        messages=[_SYSTEM, ChatMessage("user", "next turn")],
+        tools=[_SCHEMA, added],
+    )
+
+    assert first.capability_revision == 1
+    assert pinned.capability_revision == 1
+    assert _SCHEMA in pinned.tools
+    assert added not in pinned.tools
+    assert later.capability_revision == 2
+    assert added in later.tools
+    assert repo.get_snapshot("s", 0, 1) is not None
+    assert repo.get_snapshot("s", 0, 2) is not None
+    assert {item.action for item in later.diagnostics} >= {
+        "capability-revision-created",
+        "tool-added",
+    }
+
+
+def test_restart_without_capability_change_reuses_revision() -> None:
+    compiler, _ = _compiler()
+    first = compiler.compile(
+        session_key="s",
+        session_instance_id="old-process",
+        messages=[_SYSTEM, ChatMessage("user", "first")],
+        tools=[_SCHEMA],
+    )
+    restarted = compiler.compile(
+        session_key="s",
+        session_instance_id="new-process",
+        messages=[_SYSTEM, ChatMessage("user", "later")],
+        tools=[_SCHEMA],
+    )
+    assert restarted.capability_revision == first.capability_revision
+    assert restarted.stable_prefix_hash == first.stable_prefix_hash
+
+
+def test_capability_diff_diagnostic_does_not_copy_schema_description() -> None:
+    compiler, _ = _compiler()
+    compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[_SYSTEM, ChatMessage("user", "first")],
+        tools=[],
+    )
+    secret_schema = {
+        "type": "function",
+        "function": {
+            "name": "private_tool",
+            "description": "schema-secret-value",
+            "parameters": {"type": "object"},
+        },
+    }
+    changed = compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[_SYSTEM, ChatMessage("user", "second")],
+        tools=[secret_schema],
+    )
+    diagnostic_metadata = repr(changed.metadata()["diagnostics"])
+    assert "private_tool" in diagnostic_metadata
+    assert "schema-secret-value" not in diagnostic_metadata
+
+
 def test_dynamic_tail_change_keeps_prefix_and_tool_hashes() -> None:
     """§9.3 动态尾部变化只改写 context_hash，不改写稳定前缀与工具 schema。"""
 
@@ -177,3 +262,59 @@ def test_dynamic_tail_change_keeps_prefix_and_tool_hashes() -> None:
     assert base.stable_prefix_hash == changed.stable_prefix_hash
     assert base.tool_schema_hash == changed.tool_schema_hash
     assert base.context_hash != changed.context_hash
+
+
+def test_portable_structured_block_changes_context_hash_and_token_estimate() -> None:
+    """可移植结构化块与正文使用同一规范化视图参与哈希和预算。"""
+
+    compiler, _ = _compiler()
+    first = compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[
+            _SYSTEM,
+            ChatMessage("user", "go"),
+            ChatMessage(
+                "assistant",
+                "working",
+                blocks=(
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "lookup",
+                        "input": {"q": "a"},
+                    },
+                ),
+            ),
+            ChatMessage("tool", "result", tool_call_id="call-1", name="lookup"),
+        ],
+        tools=[_SCHEMA],
+    )
+    second = compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[
+            _SYSTEM,
+            ChatMessage("user", "go"),
+            ChatMessage(
+                "assistant",
+                "working",
+                blocks=(
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "lookup",
+                        "input": {"q": "a much longer portable value"},
+                    },
+                ),
+            ),
+            ChatMessage("tool", "result", tool_call_id="call-1", name="lookup"),
+        ],
+        tools=[_SCHEMA],
+    )
+
+    assert first.context_hash != second.context_hash
+    assert (
+        first.budget.estimated_input_tokens
+        < second.budget.estimated_input_tokens
+    )

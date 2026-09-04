@@ -20,7 +20,6 @@ from memoli_agent.agent.llm.contracts import (
     ModelMessage,
     ModelRequest,
     TextBlock,
-    ThinkingBlock,
     TokenUsage,
     ToolCall,
     ToolResultBlock,
@@ -39,6 +38,7 @@ from memoli_agent.agent.llm.errors import (
     ProviderTimeoutError,
     RateLimitProviderError,
     ResponseProtocolError,
+    UnsupportedReasoningPolicyError,
 )
 from memoli_agent.agent.llm.retry import RetryPolicy
 from memoli_agent.agent.types import ChatMessage
@@ -104,6 +104,7 @@ class OpenAIProvider:
                 provider=self.name,
                 model=request.model or self.model,
             )
+        self._validate_reasoning_policy(request)
         if request.stream:
             return await self._complete_stream(request, on_event)
         return await self._complete_once(request, on_event)
@@ -205,17 +206,14 @@ class OpenAIProvider:
                 reasoning = self.dialect.reasoning_delta(delta)
                 if reasoning:
                     thinking_parts.append(reasoning)
-                    await _emit(
-                        on_event,
-                        ModelEvent(ModelEventKind.THINKING_DELTA, text=reasoning),
-                    )
                 content = _openai_content(getattr(delta, "content", None))
                 if content:
                     text_parts.append(content)
-                    await _emit(
-                        on_event,
-                        ModelEvent(ModelEventKind.TEXT_DELTA, text=content),
-                    )
+                    if not self.dialect.buffer_content:
+                        await _emit(
+                            on_event,
+                            ModelEvent(ModelEventKind.TEXT_DELTA, text=content),
+                        )
                 for position, raw_call in enumerate(
                     getattr(delta, "tool_calls", None) or ()
                 ):
@@ -260,10 +258,13 @@ class OpenAIProvider:
                 if hasattr(result, "__await__"):
                     await result
 
-        blocks: list[TextBlock | ThinkingBlock | ToolUseBlock] = []
-        if thinking_parts:
-            blocks.append(ThinkingBlock("".join(thinking_parts)))
-        content = "".join(text_parts)
+        blocks: list[TextBlock | ToolUseBlock] = []
+        content = self.dialect.visible_content("".join(text_parts))
+        if self.dialect.buffer_content and content:
+            await _emit(
+                on_event,
+                ModelEvent(ModelEventKind.TEXT_DELTA, text=content),
+            )
         if content:
             blocks.append(TextBlock(content))
         tool_calls: list[ToolCall] = []
@@ -306,8 +307,40 @@ class OpenAIProvider:
             kwargs["temperature"] = request.temperature
         if request.structured_output is not None:
             kwargs["response_format"] = dict(request.structured_output)
+        policy = request.effective_reasoning_policy
+        if policy.enabled and policy.effort is not None and self.dialect.name in {
+            "default",
+            "openai",
+        }:
+            kwargs["reasoning_effort"] = policy.effort
         self.dialect.prepare(kwargs, request)
         return kwargs
+
+    def _validate_reasoning_policy(self, request: ModelRequest) -> None:
+        policy = request.effective_reasoning_policy
+        if request.continuation is not None:
+            raise UnsupportedReasoningPolicyError(
+                "Chat Completions 不接受私有推理续接信封。",
+                provider=self.name,
+                model=request.model or self.model,
+            )
+        if not policy.enabled:
+            return
+        if policy.visibility.value != "hidden":
+            raise UnsupportedReasoningPolicyError(
+                "Chat Completions 不提供可验证的推理摘要展示合同。",
+                provider=self.name,
+                model=request.model or self.model,
+            )
+        if policy.effort is not None and self.dialect.name not in {
+            "default",
+            "openai",
+        }:
+            raise UnsupportedReasoningPolicyError(
+                "所选兼容方言不支持通用推理强度。",
+                provider=self.name,
+                model=request.model or self.model,
+            )
 
     def _parse_response(self, response: Any, attempts: tuple[Any, ...]) -> LLMResponse:
         try:
@@ -319,7 +352,9 @@ class OpenAIProvider:
                 provider=self.name,
                 model=self.model,
             ) from exc
-        content = _openai_content(getattr(raw_message, "content", None))
+        content = self.dialect.visible_content(
+            _openai_content(getattr(raw_message, "content", None))
+        )
         blocks: list[TextBlock | ToolUseBlock] = []
         if content:
             blocks.append(TextBlock(content))

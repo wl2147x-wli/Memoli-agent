@@ -79,7 +79,7 @@ class ToolSearchTool:
         selected = self.registry.search_deferred(
             query,
             limit=self.limit,
-            exclude=context.allowed_tool_names,
+            exclude=context.allowed_tool_names or frozenset(),
         )
         disclosed_schemas: list[dict[str, Any]] = []
         disclosed_names: list[str] = []
@@ -92,6 +92,7 @@ class ToolSearchTool:
                 ToolDisclosure(
                     session_key=context.session_key,
                     conversation_epoch=context.conversation_epoch,
+                    capability_revision=context.capability_revision,
                     tool_name=tool.name,
                     schema_json=schema_json,
                     schema_hash=hashlib.sha256(schema_json.encode()).hexdigest(),

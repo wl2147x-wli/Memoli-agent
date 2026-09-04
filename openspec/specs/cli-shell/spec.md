@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change build-cli-launcher-and-chat-experience. Update Purpose after archive.
+定义 Memoli 命令行入口、交互式聊天体验、启动兼容性和终端呈现约束，使用户能够以一致、可诊断且可恢复的方式启动和操作本地 Agent Runtime。
 
 ## Requirements
 

@@ -11,6 +11,7 @@ from memoli_agent.agent.llm.contracts import (
     LLMResponse,
     ModelCapabilities,
     ModelRequest,
+    ReasoningPolicy,
     portable_message,
 )
 from memoli_agent.agent.llm.errors import ProviderError, UnsupportedCapabilityError
@@ -30,6 +31,7 @@ class ProviderTarget:
     context_safety_margin_tokens: int = 4_096
     token_estimator: str = "conservative"
     temperature: float | None = None
+    reasoning_policy: ReasoningPolicy = ReasoningPolicy()
 
 
 class ModelRouter:
@@ -63,7 +65,32 @@ class ModelRouter:
         attempt_count = 0
         attempt_history = []
         last_error: ProviderError | None = None
-        for index, target in enumerate((self.primary, *self.fallbacks)):
+        all_targets = (self.primary, *self.fallbacks)
+        pinned = request.continuation
+        if pinned is not None:
+            candidates = tuple(
+                target
+                for target in all_targets
+                if (
+                    (not pinned.profile or target.profile == pinned.profile)
+                    and (
+                        not pinned.provider
+                        or target.provider.name == pinned.provider
+                    )
+                    and (not pinned.model or target.model == pinned.model)
+                    and str(getattr(target.provider, "protocol", ""))
+                    == pinned.protocol
+                )
+            )
+            if len(candidates) != 1:
+                raise UnsupportedCapabilityError(
+                    "活跃交换的固定 Provider 目标不可用。",
+                    provider=pinned.provider,
+                    model=pinned.model,
+                )
+        else:
+            candidates = all_targets
+        for index, target in enumerate(candidates):
             if not target.capabilities.supports(required):
                 last_error = UnsupportedCapabilityError(
                     f"模型 Profile {target.profile!r} 不支持请求能力。",
@@ -92,6 +119,13 @@ class ModelRouter:
                     if request.temperature is not None
                     else target.temperature
                 ),
+                reasoning_policy=(
+                    pinned.reasoning_policy
+                    if pinned is not None
+                    else request.reasoning_policy
+                    if request.reasoning_policy.enabled
+                    else target.reasoning_policy
+                ),
             )
             try:
                 response = await target.provider.complete(routed_request, on_event)
@@ -100,14 +134,23 @@ class ModelRouter:
                 attempt_history.extend(exc.attempts)
                 last_error = exc
                 fallback_reason = exc.error_type
-                if not exc.retryable or exc.partial_stream:
+                if pinned is not None or not exc.retryable or exc.partial_stream:
                     raise
                 continue
             attempt_count += max(1, response.attempt_count)
             attempt_history.extend(response.attempts)
+            continuation = response.continuation
+            if continuation is not None:
+                continuation = replace(
+                    continuation,
+                    provider=target.provider.name,
+                    profile=target.profile,
+                    model=target.model,
+                    reasoning_policy=routed_request.effective_reasoning_policy,
+                )
             return replace(
                 response,
-                fallback_used=index > 0,
+                fallback_used=pinned is None and target is not self.primary,
                 profile=target.profile,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
@@ -115,6 +158,7 @@ class ModelRouter:
                 attempt_count=attempt_count,
                 attempts=tuple(attempt_history),
                 capabilities=target.capabilities.to_strings(),
+                continuation=continuation,
             )
         if last_error is not None:
             raise last_error

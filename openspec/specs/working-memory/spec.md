@@ -1,7 +1,7 @@
 # working-memory Specification
 
 ## Purpose
-TBD - created by archiving change build-evidence-backed-memory-system. Update Purpose after archive.
+定义当前任务工作记忆的确定性状态、语义 checkpoint、证据来源和更新边界，使长任务能够在上下文缩减、工具执行与进程恢复后继续保持可验证的一致状态。
 ## Requirements
 ### Requirement: Hybrid working-state projection
 

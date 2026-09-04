@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -109,6 +109,7 @@ class OpenAICompatibleCandidateExtractor:
     base_url: str
     timeout_seconds: float
     fingerprint: ExtractorFingerprint
+    api_key: str = field(default="", repr=False)
 
     async def extract(
         self, segments: tuple[SourceSegment, ...]
@@ -121,7 +122,9 @@ class OpenAICompatibleCandidateExtractor:
     def _extract_sync(
         self, segments: tuple[SourceSegment, ...]
     ) -> tuple[CandidateDraft, ...]:
-        api_key = os.environ.get(self.api_key_env, "").strip()
+        api_key = self.api_key.strip() or os.environ.get(
+            self.api_key_env, ""
+        ).strip()
         if not api_key:
             raise ExtractorPermanentError("extractor-credential-missing")
         sources = [

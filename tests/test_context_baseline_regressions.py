@@ -328,11 +328,8 @@ def test_clear_advances_epoch_and_resets_derived_context_state() -> None:
     )
 
 
-def test_new_session_instance_reuses_frozen_snapshot() -> None:
-    """1.3 现状：snapshot 按 session_key 查找，忽略 session_instance_id。
-
-    新进程/新 instance 复用旧冻结前缀；change §7 将把主键改为 (session_key, epoch)。
-    """
+def test_new_session_instance_reconciles_changed_capabilities() -> None:
+    """新进程不因 instance ID 刷新，但规范能力变化会创建新 revision。"""
 
     compiler, _ = _make_compiler(window=8_000, recent_tail=50)
     first = compiler.compile(
@@ -350,8 +347,9 @@ def test_new_session_instance_reuses_frozen_snapshot() -> None:
         ],
         tools=[],
     )
-    assert first.stable_prefix_hash == second.stable_prefix_hash
-    assert second.messages[0].content == "version one"
+    assert second.capability_revision == first.capability_revision + 1
+    assert first.stable_prefix_hash != second.stable_prefix_hash
+    assert second.messages[0].content == "version two"
 
 
 # ---- 1.4 结构化 block producer 按角色分类、完整 tool pair 成对保留（§4 已修复）----
@@ -454,7 +452,7 @@ def test_pre_change_context_state_schema_baseline(tmp_path: Path) -> None:
     v1 schema 作迁移对照，迁移落地后翻转为验证迁移结果。
     """
 
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     db = tmp_path / "context.db"
     _seed_v1_context_db(db)  # 旧 v1 schema + 一条 epoch 仅在 JSON 中的 archive
     repo = SQLiteContextStateRepository(db)
@@ -490,12 +488,16 @@ def test_pre_change_context_state_schema_baseline(tmp_path: Path) -> None:
         ).fetchall()
     }
     assert "coverage_active_unique" in indexes
-    # §7.1 snapshots 主键迁移为 (session_key, conversation_epoch)
+    # capability revision：旧 snapshot 迁移为 revision 1 并纳入复合主键。
     snap_cols = repo._connection.execute(
         "PRAGMA table_info(snapshots)"
     ).fetchall()
     pk_cols = {row["name"] for row in snap_cols if row["pk"]}
-    assert pk_cols == {"session_key", "conversation_epoch"}
+    assert pk_cols == {
+        "session_key",
+        "conversation_epoch",
+        "capability_revision",
+    }
     # §7.4 previews 加 visible 列（v3→v4 ALTER，旧预览默认 visible=1）
     preview_cols = {
         row["name"]

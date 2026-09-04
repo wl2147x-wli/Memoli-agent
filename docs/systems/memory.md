@@ -111,6 +111,7 @@ maintenance_batch_size = 4
 [memory.embedding]
 enabled = false
 provider = "openai-compatible"
+api_key = ""                  # 与 api_key_env 二选一
 model = ""
 version = "1"
 base_url = "https://api.openai.com/v1"
@@ -162,10 +163,12 @@ stale_policy = "mark"
 既有部署；新配置应显式写 `engine = "sqlite"`。`memory.enabled = false` 时普通
 Agent Loop 继续运行，工作记忆也不受影响。
 
-Embedding key 只通过 `api_key_env` 指向的环境变量提供。开发/测试可使用
-`provider = "deterministic"`，但它不适合作为真实语义模型。远程 embedding 与聊天
-provider 相互独立，索引 worker 在启动和已发布回复后的空闲点串行处理有界批次，
-不会并发执行 agent turn。
+OpenAI-compatible Embedding 与离线 Extractor 均支持直接 `api_key` 或
+`api_key_env` 指向的环境变量，二者必须且只能选择一种非空来源。本地无认证服务可用
+`api_key = "EMPTY"`；生产密钥仍建议使用环境变量。两类凭据都不会进入配置 repr、
+运行轨迹、诊断、错误或记忆导出。开发/测试也可使用 `provider = "deterministic"`，
+但它不适合作为真实语义模型。远程 embedding 与聊天 provider 相互独立，索引 worker
+在启动和已发布回复后的空闲点串行处理有界批次，不会并发执行 agent turn。
 
 ## 迁移、备份与恢复
 

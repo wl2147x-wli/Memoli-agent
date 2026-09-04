@@ -51,6 +51,27 @@ from memoli_agent.agent.trajectory import SQLiteTrajectoryStore
 from memoli_agent.bootstrap.config import AppConfig
 
 
+def _resolve_memory_provider_key(
+    *, api_key: str, api_key_env: str, provider_name: str
+) -> str:
+    """解析互斥的直接凭据或环境变量凭据，且不回显秘密。"""
+
+    direct = api_key.strip()
+    variable = api_key_env.strip()
+    if direct and variable:
+        raise ValueError(
+            f"{provider_name} 的 api_key 与 api_key_env 不能同时配置。"
+        )
+    if direct:
+        return direct
+    if not variable:
+        raise ValueError(f"{provider_name} 必须配置 api_key 或 api_key_env。")
+    resolved = os.environ.get(variable, "").strip()
+    if not resolved:
+        raise ValueError(f"{provider_name} 凭据环境变量未配置：{variable}")
+    return resolved
+
+
 def build_candidate_extractor(config: AppConfig) -> CandidateExtractor | None:
     """按独立配置创建版本化 Extractor；不复用聊天凭据。"""
 
@@ -73,16 +94,18 @@ def build_candidate_extractor(config: AppConfig) -> CandidateExtractor | None:
         return DeterministicCandidateExtractor(fingerprint)
     if not extractor.model.strip():
         raise ValueError("openai-compatible memory Extractor 必须配置 model。")
-    if not os.environ.get(extractor.api_key_env, "").strip():
-        raise ValueError(
-            f"memory Extractor 凭据环境变量未配置：{extractor.api_key_env}"
-        )
+    api_key = _resolve_memory_provider_key(
+        api_key=extractor.api_key,
+        api_key_env=extractor.api_key_env,
+        provider_name="memory Extractor",
+    )
     return OpenAICompatibleCandidateExtractor(
         model=extractor.model,
         api_key_env=extractor.api_key_env,
         base_url=extractor.base_url,
         timeout_seconds=extractor.timeout_seconds,
         fingerprint=fingerprint,
+        api_key=api_key,
     )
 
 
@@ -121,6 +144,11 @@ def build_memory_runtime(
             version=embedding.version,
         )
     elif embedding.enabled and embedding.provider == "openai-compatible":
+        api_key = _resolve_memory_provider_key(
+            api_key=embedding.api_key,
+            api_key_env=embedding.api_key_env,
+            provider_name="memory Embedding",
+        )
         embedder = OpenAICompatibleEmbedder(
             model=embedding.model,
             api_key_env=embedding.api_key_env,
@@ -128,6 +156,7 @@ def build_memory_runtime(
             base_url=embedding.base_url,
             version=embedding.version,
             timeout_seconds=embedding.timeout_seconds,
+            api_key=api_key,
         )
     else:
         embedder = DisabledEmbedder()

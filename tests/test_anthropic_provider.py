@@ -10,12 +10,18 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 
+from memoli_agent.agent.core.reasoner import Reasoner
 from memoli_agent.agent.llm.anthropic_provider import AnthropicProvider
 from memoli_agent.agent.llm.contracts import (
     ModelEvent,
     ModelEventKind,
     ModelMessage,
     ModelRequest,
+    OpaqueContinuation,
+    ReasoningMode,
+    ReasoningPolicy,
+    ReasoningSummaryBlock,
+    ReasoningVisibility,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -27,8 +33,12 @@ from memoli_agent.agent.llm.errors import (
     ContextLengthProviderError,
     InvalidRequestProviderError,
     PermissionProviderError,
+    UnsupportedReasoningPolicyError,
 )
 from memoli_agent.agent.llm.retry import RetryPolicy
+from memoli_agent.agent.tools.base import ToolResult
+from memoli_agent.agent.tools.registry import ToolRegistry
+from memoli_agent.agent.types import ChatMessage
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -112,6 +122,7 @@ def test_anthropic_native_round_trip_preserves_thinking_and_tool_links() -> None
                 },
             },
         ),
+        reasoning=True,
     )
 
     response = _run(provider.complete(request))
@@ -128,9 +139,11 @@ def test_anthropic_native_round_trip_preserves_thinking_and_tool_links() -> None
     assert seen["body"]["messages"][-2]["content"][0]["signature"] == (
         "prior-signature"
     )
-    thinking = response.message.blocks[0]
-    assert isinstance(thinking, ThinkingBlock)
-    assert thinking.signature == "signed-continuation"
+    assert all(
+        not isinstance(block, ThinkingBlock) for block in response.message.blocks
+    )
+    assert response.continuation is not None
+    assert response.continuation.items[0]["signature"] == "signed-continuation"
     assert response.tool_calls[0].id == "toolu-2"
     assert response.usage == {
         "input_tokens": 20,
@@ -138,6 +151,225 @@ def test_anthropic_native_round_trip_preserves_thinking_and_tool_links() -> None
         "total_tokens": 27,
         "cached_input_tokens": 4,
     }
+
+
+def test_anthropic_opaque_continuation_replays_original_order() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-test",
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "summary",
+                            "signature": "private-signature",
+                        },
+                        {"type": "text", "text": "checking"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-1",
+                            "name": "lookup",
+                            "input": {"q": "memoli"},
+                        },
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-2",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+        )
+
+    provider, client = _provider(httpx.MockTransport(handle))
+    policy = ReasoningPolicy(ReasoningMode.ADAPTIVE)
+    first = _run(
+        provider.complete(
+            ModelRequest(
+                (ModelMessage("user", (TextBlock("go"),)),),
+                reasoning_policy=policy,
+            )
+        )
+    )
+    assert first.message is not None
+    assert first.continuation is not None
+    completed = _run(
+        provider.complete(
+            ModelRequest(
+                (
+                    ModelMessage("user", (TextBlock("go"),)),
+                    first.message,
+                    ModelMessage(
+                        "user", (ToolResultBlock("toolu-1", "result"),)
+                    ),
+                ),
+                reasoning_policy=policy,
+                continuation=first.continuation,
+            )
+        )
+    )
+    _run(client.close())
+
+    assert completed.content == "done"
+    assert [
+        block["type"] for block in bodies[1]["messages"][-2]["content"]
+    ] == ["thinking", "text", "tool_use"]
+    assert (
+        bodies[1]["messages"][-2]["content"][0]["signature"]
+        == "private-signature"
+    )
+
+
+def test_anthropic_rejects_disabling_reasoning_during_continuation() -> None:
+    called = False
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    provider, client = _provider(httpx.MockTransport(handle))
+    continuation = OpaqueContinuation(
+        "anthropic",
+        items=(
+            {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "private-signature",
+            },
+        ),
+        reasoning_policy=ReasoningPolicy(ReasoningMode.ADAPTIVE),
+    )
+
+    with pytest.raises(UnsupportedReasoningPolicyError):
+        _run(
+            provider.complete(
+                ModelRequest(
+                    (ModelMessage("user", (TextBlock("continue"),)),),
+                    continuation=continuation,
+                )
+            )
+        )
+    _run(client.close())
+    assert called is False
+
+
+def test_anthropic_reasoner_multi_tool_exchange_replays_all_private_blocks() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg-tools",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-test",
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "safe summary",
+                            "signature": "private-signature",
+                        },
+                        {"type": "redacted_thinking", "data": "private-data"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-a",
+                            "name": "first",
+                            "input": {"value": 1},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-b",
+                            "name": "second",
+                            "input": {"value": 2},
+                        },
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 3},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-final",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "完成"}],
+                "usage": {"input_tokens": 8, "output_tokens": 1},
+            },
+        )
+
+    class RecordingTool:
+        description = "测试工具"
+        parameters = {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+        }
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, arguments: dict[str, Any]) -> ToolResult:
+            self.calls.append(arguments)
+            return ToolResult(f"{self.name}-result")
+
+    provider, client = _provider(httpx.MockTransport(handle))
+    first = RecordingTool("first")
+    second = RecordingTool("second")
+    registry = ToolRegistry()
+    registry.register(first)
+    registry.register(second)
+    result = _run(
+        Reasoner(
+            provider,
+            tool_registry=registry,
+            reasoning_policy=ReasoningPolicy(
+                ReasoningMode.ADAPTIVE,
+                visibility=ReasoningVisibility.HIDDEN,
+            ),
+        ).run_turn([ChatMessage("user", "执行两个工具")], session_key="anthropic-e2e")
+    )
+    _run(client.close())
+
+    assert result.response.content == "完成"
+    assert first.calls == [{"value": 1}]
+    assert second.calls == [{"value": 2}]
+    replay = bodies[1]["messages"][-2]["content"]
+    assert [block["type"] for block in replay] == [
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_use",
+    ]
+    assert replay[0]["signature"] == "private-signature"
+    assert replay[1]["data"] == "private-data"
+    assert [block["tool_use_id"] for block in bodies[1]["messages"][-1]["content"]] == [
+        "toolu-a",
+        "toolu-b",
+    ]
+    assert "private-signature" not in repr(result)
 
 
 def test_anthropic_sse_assembles_thinking_tool_input_and_usage() -> None:
@@ -258,12 +490,97 @@ def test_anthropic_sse_assembles_thinking_tool_input_and_usage() -> None:
     )
     _run(client.close())
 
-    assert isinstance(response.message.blocks[0], ThinkingBlock)
-    assert response.message.blocks[0].signature == "sig"
+    assert isinstance(response.message.blocks[0], ToolUseBlock)
+    assert response.continuation is not None
+    assert response.continuation.items[0]["signature"] == "sig"
     assert response.tool_calls[0].arguments == {"q": "memoli"}
     assert response.usage["total_tokens"] == 15
-    assert ModelEventKind.THINKING_DELTA in [event.kind for event in emitted]
+    assert ModelEventKind.THINKING_DELTA not in [event.kind for event in emitted]
     assert ModelEventKind.TOOL_CALL_DELTA in [event.kind for event in emitted]
+
+
+def test_anthropic_visible_updates_do_not_emit_private_signature() -> None:
+    events = [
+        (
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg-stream",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-stream",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            },
+        ),
+        (
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        ),
+        (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "摘要"},
+            },
+        ),
+        (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "private-signature"},
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    body = "".join(
+        f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in events
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}
+        )
+
+    provider, client = _provider(httpx.MockTransport(handle))
+    emitted: list[ModelEvent] = []
+
+    async def on_event(event: ModelEvent) -> None:
+        emitted.append(event)
+
+    response = _run(
+        provider.complete(
+            ModelRequest(
+                (ModelMessage("user", (TextBlock("go"),)),),
+                stream=True,
+                reasoning_policy=ReasoningPolicy(
+                    ReasoningMode.ADAPTIVE,
+                    visibility=ReasoningVisibility.UPDATES,
+                ),
+            ),
+            on_event,
+        )
+    )
+    _run(client.close())
+
+    assert response.message is not None
+    assert isinstance(response.message.blocks[0], ReasoningSummaryBlock)
+    summary_events = [
+        event for event in emitted
+        if event.kind is ModelEventKind.REASONING_SUMMARY_DELTA
+    ]
+    assert [event.text for event in summary_events] == ["摘要"]
+    assert "private-signature" not in repr(emitted)
 
 
 @pytest.mark.parametrize("transient_status", [408, 429, 500, 529])

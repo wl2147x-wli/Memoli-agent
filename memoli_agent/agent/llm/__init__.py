@@ -13,7 +13,13 @@ from memoli_agent.agent.llm.contracts import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    OpaqueContinuation,
     ProviderAttempt,
+    ProviderExchange,
+    ReasoningMode,
+    ReasoningPolicy,
+    ReasoningSummaryBlock,
+    ReasoningVisibility,
     TextBlock,
     ThinkingBlock,
     TokenUsage,
@@ -21,8 +27,12 @@ from memoli_agent.agent.llm.contracts import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from memoli_agent.agent.llm.errors import ProviderError
+from memoli_agent.agent.llm.errors import (
+    ProviderError,
+    UnsupportedReasoningPolicyError,
+)
 from memoli_agent.agent.llm.openai_provider import OpenAIProvider
+from memoli_agent.agent.llm.openai_responses_provider import OpenAIResponsesProvider
 from memoli_agent.agent.llm.router import ModelRouter, ProviderTarget
 
 __all__ = [
@@ -40,13 +50,21 @@ __all__ = [
     "ModelResponse",
     "ModelRouter",
     "OpenAIProvider",
+    "OpenAIResponsesProvider",
+    "OpaqueContinuation",
     "ProviderError",
     "ProviderAttempt",
+    "ProviderExchange",
     "ProviderTarget",
+    "ReasoningMode",
+    "ReasoningPolicy",
+    "ReasoningSummaryBlock",
+    "ReasoningVisibility",
     "TextBlock",
     "ThinkingBlock",
     "TokenUsage",
     "ToolCall",
     "ToolResultBlock",
     "ToolUseBlock",
+    "UnsupportedReasoningPolicyError",
 ]

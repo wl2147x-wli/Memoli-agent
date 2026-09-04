@@ -1,7 +1,7 @@
 # agent-task-graph Specification
 
 ## Purpose
-TBD - created by archiving change build-durable-subagent-graph. Update Purpose after archive.
+定义 Agent 与任务图的持久身份、依赖、控制消息、恢复和产物边界，确保多 Agent 委派在并发、重启和失败场景下仍可追踪、可恢复且不会破坏任务图一致性。
 ## Requirements
 ### Requirement: Durable agent and task identities
 

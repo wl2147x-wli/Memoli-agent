@@ -21,7 +21,8 @@ class ToolExecutionContext:
     session_instance_id: str = ""
     span_id: str = ""
     conversation_epoch: int = 0
-    allowed_tool_names: frozenset[str] = frozenset()
+    capability_revision: int = 1
+    allowed_tool_names: frozenset[str] | None = None
 
 
 _CURRENT_CONTEXT: ContextVar[ToolExecutionContext | None] = ContextVar(

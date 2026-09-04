@@ -297,6 +297,10 @@ class RuntimeInspector:
         prefix = str(summary.get("stable_prefix_hash", ""))[:12]
         tools_hash = str(summary.get("tool_schema_hash", ""))[:12]
         ctx_hash = str(summary.get("context_hash", ""))[:12]
+        capability_revision = int(summary.get("capability_revision", 0) or 0)
+        lines.append(
+            f"capability_revision: {capability_revision or 'unavailable'}"
+        )
         lines.append(
             "hashes: "
             f"prefix={prefix or '-'} tools={tools_hash or '-'} "

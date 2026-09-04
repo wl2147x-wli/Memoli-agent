@@ -14,6 +14,7 @@ from memoli_agent.agent.context_management import (
     ContextCompiler,
     ContextCompilerSettings,
     ContextSnapshotInvalidated,
+    ContextStateError,
     InMemoryContextStateRepository,
     SQLiteContextStateRepository,
     ToolResultPreviewer,
@@ -68,6 +69,7 @@ def test_snapshot_is_stable_while_dynamic_tail_changes() -> None:
             ChatMessage("system", '<agent_status revision="2">two</agent_status>'),
         ],
         tools=[{"type": "function", "function": {"name": "a"}}],
+        capability_revision=first.capability_revision,
     )
     assert first.stable_prefix_hash == second.stable_prefix_hash
     assert first.tool_schema_hash == second.tool_schema_hash
@@ -92,6 +94,7 @@ def test_added_tool_does_not_rewrite_snapshot_and_revocation_invalidates() -> No
         session_instance_id="i",
         messages=[ChatMessage("system", "security"), ChatMessage("user", "two")],
         tools=[*first_tools, {"type": "function", "function": {"name": "c"}}],
+        capability_revision=first.capability_revision,
     )
     assert first.tools == added.tools
     assert first.tool_schema_hash == added.tool_schema_hash
@@ -107,10 +110,52 @@ def test_added_tool_does_not_rewrite_snapshot_and_revocation_invalidates() -> No
             messages=[ChatMessage("system", "security"), ChatMessage("user", "three")],
             tools=[first_tools[1]],
             revoked_tool_names=frozenset({"a"}),
+            capability_revision=first.capability_revision,
         )
-    snapshot = repo.get_snapshot("s")
+    snapshot = repo.get_snapshot("s", 0, first.capability_revision)
     assert snapshot is not None
     assert snapshot.invalidated_reason == "tool-revoked:a"
+
+    next_turn = compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[ChatMessage("system", "security"), ChatMessage("user", "four")],
+        tools=[first_tools[1]],
+    )
+    assert next_turn.capability_revision == first.capability_revision + 1
+    assert {item["function"]["name"] for item in next_turn.tools} == {"b"}
+
+
+def test_capability_drift_persistence_failure_does_not_reuse_stale_snapshot() -> None:
+    class FailChangedSnapshotRepository(InMemoryContextStateRepository):
+        def save_snapshot(self, snapshot):  # type: ignore[no-untyped-def]
+            if self.get_snapshot(snapshot.session_key, snapshot.conversation_epoch):
+                raise ContextStateError("injected revision write failure")
+            return super().save_snapshot(snapshot)
+
+    repo = FailChangedSnapshotRepository()
+    compiler = ContextCompiler(
+        repo,
+        ConservativeTokenEstimator(),
+        ContextCompilerSettings(1_000, 50, 20),
+    )
+    compiler.compile(
+        session_key="s",
+        session_instance_id="i",
+        messages=[ChatMessage("system", "security"), ChatMessage("user", "one")],
+        tools=[],
+    )
+    with pytest.raises(ContextStateError, match="revision write failure"):
+        compiler.compile(
+            session_key="s",
+            session_instance_id="i",
+            messages=[
+                ChatMessage("system", "changed security"),
+                ChatMessage("user", "two"),
+            ],
+            tools=[],
+        )
+    assert repo.get_snapshot("s").system_prompt == "security"  # type: ignore[union-attr]
 
 
 def test_emergency_compile_keeps_recent_group_and_plans_old_compaction() -> None:
