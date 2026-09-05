@@ -1,0 +1,911 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  MessageSquare,
+  Eye,
+  Image as ImageIcon,
+  Mic,
+  Volume2,
+  Database,
+  Search as SearchIcon,
+  Plus,
+  Check,
+  Loader2,
+  Pencil,
+  Eye as EyeIcon,
+  EyeOff,
+  ExternalLink,
+} from 'lucide-react'
+import { t, localizedLabel } from '../../i18n'
+import apiClient from '../../api/client'
+import type { CapabilityState, ModelsData, ModelProvider, SearchCapabilityState } from '../../types'
+import { Card, Field, Dropdown, TextInput, Modal, Btn, MASK_RE } from './primitives'
+import CapabilityCard from './CapabilityCard'
+import { ChatFallbackButton } from './ChatFallbackCard'
+import { normEntries, providerLabel, resolveVoices, CUSTOM_OPTION } from './modelsHelpers'
+import { product } from '@product'
+
+// “添加自定义提供商”条目是否可用。默认为 true。
+const allowCustomProviders = product.models?.allowCustomProviders !== false
+
+// LinkAI是一个聚合平台，因此当选择LinkAI提供商时我们
+// 将用户引导至其控制台以创建/管理聚合密钥。仅显示
+// 对于该提供商 - 其他供应商在自己的站点上管理密钥。
+const ManageLinkAIKeyLink: React.FC = () => (
+  <button
+    type="button"
+    onClick={() =>
+      window.open('https://link-ai.tech/console/models?apikey=1', '_blank', 'noopener,noreferrer')
+    }
+    className="inline-flex items-center gap-1 text-xs text-accent hover:underline cursor-pointer"
+  >
+    {t('models_manage_api_key')}
+    <ExternalLink size={11} className="shrink-0" />
+  </button>
+)
+
+interface ModelsTabProps {
+  baseUrl: string
+}
+
+const REPLY_MODES: { value: 'off' | 'voice_if_voice' | 'always'; key: string }[] = [
+  { value: 'off', key: 'models_tts_mode_off' },
+  { value: 'voice_if_voice', key: 'models_tts_mode_if_voice' },
+  { value: 'always', key: 'models_tts_mode_always' },
+]
+
+const ModelsTab: React.FC<ModelsTabProps> = ({ baseUrl }) => {
+  const [data, setData] = useState<ModelsData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState<string>('') // 当前正在保存的功能键
+  const [statusMap, setStatusMap] = useState<Record<string, string>>({})
+
+  const load = useCallback(async () => {
+    try {
+      const fresh = await apiClient.getModels()
+      setData(fresh)
+    } catch (e) {
+      console.error('Failed to load models:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    apiClient.setBaseUrl(baseUrl)
+    load()
+  }, [baseUrl, load])
+
+  const flash = (key: string, msg: string) => {
+    setStatusMap((m) => ({ ...m, [key]: msg }))
+    setTimeout(() => setStatusMap((m) => ({ ...m, [key]: '' })), 2000)
+  }
+
+  // 运行模型操作，然后刷新并闪烁给定键的状态。
+  const run = async (key: string, action: Parameters<typeof apiClient.modelsAction>[0]) => {
+    setBusy(key)
+    try {
+      const res = await apiClient.modelsAction(action)
+      if (res.status === 'success') {
+        await load()
+        flash(key, t('config_saved'))
+      } else {
+        flash(key, (res.message as string) || t('config_save_error'))
+      }
+    } catch {
+      flash(key, t('config_save_error'))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-20 text-content-tertiary">
+        <Loader2 size={18} className="animate-spin mr-2" />
+        {t('skills_loading')}
+      </div>
+    )
+  }
+  if (!data) {
+    return <div className="text-center py-20 text-content-tertiary">{t('config_save_error')}</div>
+  }
+
+  const caps = data.capabilities
+
+  return (
+    <div className="grid gap-5">
+      <VendorSection data={data} onChanged={load} statusMap={statusMap} flash={flash} />
+
+      {/* 聊天 — 后备措施是这张卡标题上的一个小按钮
+          比一张单独的卡更重要，因为它是一个很少被触及的安全网。 */}
+      <CapabilityCard
+        icon={MessageSquare}
+        title={t('models_cap_chat')}
+        subtitle={t('models_cap_chat_sub')}
+        capKey="chat"
+        state={caps.chat}
+        data={data}
+        allowCustomModel
+        busy={busy === 'chat'}
+        status={statusMap.chat}
+        onSave={(p, m) => run('chat', { action: 'set_capability', capability: 'chat', provider_id: p, model: m })}
+        action={
+          <ChatFallbackButton
+            state={caps.chat_fallback}
+            data={data}
+            busy={busy === 'chat_fallback'}
+            status={statusMap.chat_fallback}
+            onSave={({ providerId, model, enabled, maxSwitches }) =>
+              run('chat_fallback', {
+                action: 'set_capability',
+                capability: 'chat_fallback',
+                provider_id: providerId,
+                model,
+                enabled,
+                max_switches: maxSwitches,
+              })
+            }
+          />
+        }
+      />
+
+      {/* 愿景 */}
+      <CapabilityCard
+        icon={Eye}
+        title={t('models_cap_vision')}
+        subtitle={t('models_cap_vision_sub')}
+        capKey="vision"
+        state={caps.vision}
+        data={data}
+        allowAuto
+        autoLabel={t('models_auto')}
+        busy={busy === 'vision'}
+        status={statusMap.vision}
+        onSave={(p, m) => run('vision', { action: 'set_capability', capability: 'vision', provider_id: p, model: m })}
+      >
+        <FallbackHint state={caps.vision} data={data} />
+      </CapabilityCard>
+
+      {/* 图片 */}
+      <CapabilityCard
+        icon={ImageIcon}
+        title={t('models_cap_image')}
+        subtitle={t('models_cap_image_sub')}
+        capKey="image"
+        state={caps.image}
+        data={data}
+        allowAuto
+        autoLabel={t('models_auto')}
+        busy={busy === 'image'}
+        status={statusMap.image}
+        onSave={(p, m) => run('image', { action: 'set_capability', capability: 'image', provider_id: p, model: m })}
+      >
+        <FallbackHint state={caps.image} data={data} />
+      </CapabilityCard>
+
+      {/* 自动语音识别 */}
+      <CapabilityCard
+        icon={Mic}
+        title={t('models_cap_asr')}
+        subtitle={t('models_cap_asr_sub')}
+        capKey="asr"
+        state={caps.asr}
+        data={data}
+        allowAuto
+        autoLabel={t('models_asr_auto')}
+        allowCustomModel
+        busy={busy === 'asr'}
+        status={statusMap.asr}
+        onSave={(p, m) => run('asr', { action: 'set_capability', capability: 'asr', provider_id: p, model: m })}
+      />
+
+      {/* TTS — 定制（语音+回复模式） */}
+      <TtsCard
+        state={caps.tts}
+        data={data}
+        busy={busy === 'tts'}
+        status={statusMap.tts}
+        onSaveVoice={(p, m, v) =>
+          run('tts', { action: 'set_capability', capability: 'tts', provider_id: p, model: m, voice: v })
+        }
+        onSaveMode={(mode) => run('tts_mode', { action: 'set_voice_reply_mode', mode })}
+        modeStatus={statusMap.tts_mode}
+        modeBusy={busy === 'tts_mode'}
+      />
+
+      {/* 嵌入 */}
+      <EmbeddingCard
+        state={caps.embedding}
+        data={data}
+        busy={busy === 'embedding'}
+        status={statusMap.embedding}
+        onSave={(p, m) => run('embedding', { action: 'set_capability', capability: 'embedding', provider_id: p, model: m })}
+      />
+
+      {/* 搜索——定制 */}
+      <SearchCard
+        state={caps.search}
+        busy={busy === 'search'}
+        status={statusMap.search}
+        onSaveStrategy={(strategy, provider) =>
+          run('search', { action: 'set_capability', capability: 'search', strategy, provider })
+        }
+        onSaveBochaKey={(key) => run('search_key', { action: 'set_search_credential', api_key: key })}
+        keyStatus={statusMap.search_key}
+        keyBusy={busy === 'search_key'}
+      />
+    </div>
+  )
+}
+
+// ============================================================
+// 第 1 层 — 供应商凭证
+// ============================================================
+
+interface VendorSectionProps {
+  data: ModelsData
+  onChanged: () => Promise<void>
+  statusMap: Record<string, string>
+  flash: (key: string, msg: string) => void
+}
+
+const VendorSection: React.FC<VendorSectionProps> = ({ data, onChanged }) => {
+  // 编辑现有的内置供应商。
+  const [editing, setEditing] = useState<ModelProvider | null>(null)
+  // 添加流程：使用提供商选择器打开供应商模式。
+  const [adding, setAdding] = useState(false)
+  // 自定义提供程序模式：创建“新”，或编辑提供程序。
+  const [customEditing, setCustomEditing] = useState<ModelProvider | 'new' | null>(null)
+
+  const isCustomCard = (p: ModelProvider) => p.is_custom && !!p.custom_name
+  // 统一网格：配置的内置插件+所有自定义提供商卡（网络奇偶校验）。
+  const shown = data.providers.filter((p) => p.configured || isCustomCard(p))
+
+  return (
+    <Card icon={<Database size={16} />} title={t('models_vendors')} subtitle={t('models_vendors_sub')}>
+      {shown.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-8 rounded-btn border border-dashed border-default">
+          <p className="text-sm text-content-tertiary">{t('models_no_vendor')}</p>
+          <button
+            onClick={() => setAdding(true)}
+            className="mt-3 inline-flex items-center gap-1 px-3 py-1.5 rounded-btn text-xs font-medium bg-accent-soft text-accent hover:bg-accent-soft/70 cursor-pointer transition-colors"
+          >
+            <Plus size={12} /> {t('models_add_vendor')}
+          </button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          {shown.map((p) =>
+            isCustomCard(p) ? (
+              <VendorChip key={p.id} provider={p} onClick={() => setCustomEditing(p)} />
+            ) : (
+              <VendorChip key={p.id} provider={p} onClick={() => setEditing(p)} />
+            )
+          )}
+          <button
+            onClick={() => setAdding(true)}
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-btn border border-dashed border-default text-content-tertiary hover:border-accent hover:text-accent cursor-pointer transition-colors text-sm"
+          >
+            <Plus size={14} /> {t('models_add_vendor')}
+          </button>
+        </div>
+      )}
+
+      <VendorModal
+        provider={editing}
+        addMode={adding}
+        data={data}
+        onClose={() => {
+          setEditing(null)
+          setAdding(false)
+        }}
+        onPickCustom={() => {
+          setAdding(false)
+          setCustomEditing('new')
+        }}
+        onSaved={onChanged}
+      />
+      <CustomProviderModal target={customEditing} onClose={() => setCustomEditing(null)} onSaved={onChanged} />
+    </Card>
+  )
+}
+
+const VendorChip: React.FC<{ provider: ModelProvider; onClick: () => void }> = ({ provider, onClick }) => (
+  <button
+    onClick={onClick}
+    className="group flex items-center gap-2.5 px-3 py-2.5 rounded-btn border border-default bg-inset-2 hover:border-accent cursor-pointer transition-colors text-left"
+  >
+    <span className="flex-shrink-0 w-7 h-7 rounded-lg bg-surface-2 text-content-secondary flex items-center justify-center text-xs font-bold">
+      {(localizedLabel(provider.label) || provider.id || '?').slice(0, 1).toUpperCase()}
+    </span>
+    <span className="flex-1 min-w-0 text-sm font-medium text-content truncate">{localizedLabel(provider.label)}</span>
+    <Pencil size={12} className="flex-shrink-0 text-content-tertiary group-hover:text-accent transition-colors" />
+  </button>
+)
+
+const CUSTOM_PICK = '__custom_new__'
+
+const VendorModal: React.FC<{
+  provider: ModelProvider | null
+  addMode: boolean
+  data: ModelsData
+  onClose: () => void
+  onPickCustom: () => void
+  onSaved: () => Promise<void>
+}> = ({ provider, addMode, data, onClose, onPickCustom, onSaved }) => {
+  const open = !!provider || addMode
+
+  // 在添加模式下，用户首先选择一个内置提供者；那个选择
+  // 成为我们编辑其关键/基本字段的有效提供者。排除所有
+  // 自定义供应商（命名或空占位符）：自定义供应商通过添加
+  // 下面的单个“自定义供应商”选项，因此必须有一个空的自定义占位符
+  // 不会在此处显示为第二个重复的自定义条目。
+  const builtins = useMemo(() => data.providers.filter((p) => !p.is_custom), [data.providers])
+  const firstUnconfigured = builtins.find((p) => !p.configured) || builtins[0]
+  const [pickId, setPickId] = useState('')
+
+  const effective: ModelProvider | undefined = provider || builtins.find((p) => p.id === pickId)
+
+  const [apiKey, setApiKey] = useState('')
+  const [keyDirty, setKeyDirty] = useState(false)
+  const [keyVisible, setKeyVisible] = useState(false)
+  const [apiBase, setApiBase] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  // 每当有效提供者发生变化时加载字段。
+  useEffect(() => {
+    if (!open) return
+    const init = provider || (addMode ? firstUnconfigured : undefined)
+    setPickId(provider ? provider.id : firstUnconfigured?.id || '')
+    setApiKey(init?.api_key_masked || '')
+    setApiBase(init?.api_base || '')
+    setKeyDirty(false)
+    setKeyVisible(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, addMode, open])
+
+  if (!open) return null
+
+  const pickOptions = [
+    ...builtins.map((p) => ({
+      value: p.id,
+      label: localizedLabel(p.label),
+      hint: p.configured ? t('models_configured') : undefined,
+    })),
+    ...(allowCustomProviders
+      ? [{ value: CUSTOM_PICK, label: t('models_custom_vendor'), hint: t('models_add_custom_hint') }]
+      : []),
+  ]
+
+  const onPick = (val: string) => {
+    if (val === CUSTOM_PICK) {
+      onPickCustom()
+      return
+    }
+    setPickId(val)
+    const p = builtins.find((x) => x.id === val)
+    setApiKey(p?.api_key_masked || '')
+    setApiBase(p?.api_base || '')
+    setKeyDirty(false)
+  }
+
+  const hasBase = !!effective?.api_base_field
+
+  const save = async () => {
+    if (!effective) return
+    setSaving(true)
+    try {
+      const payload: { action: 'set_provider'; provider_id: string; api_key?: string; api_base?: string } = {
+        action: 'set_provider',
+        provider_id: effective.id,
+      }
+      if (keyDirty && apiKey && !MASK_RE.test(apiKey)) payload.api_key = apiKey
+      if (hasBase) payload.api_base = apiBase
+      await apiClient.modelsAction(payload)
+      await onSaved()
+      onClose()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const clear = async () => {
+    if (!effective || !confirm(t('models_clear_confirm'))) return
+    setSaving(true)
+    try {
+      await apiClient.modelsAction({ action: 'delete_provider', provider_id: effective.id })
+      await onSaved()
+      onClose()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      title={addMode ? t('models_add_vendor') : localizedLabel(effective?.label)}
+      onClose={onClose}
+      footer={
+        <>
+          {!addMode && effective?.configured && (
+            <Btn variant="danger" onClick={clear} disabled={saving}>
+              {t('models_clear')}
+            </Btn>
+          )}
+          <Btn variant="ghost" onClick={onClose}>
+            {t('config_cancel')}
+          </Btn>
+          <Btn variant="primary" onClick={save} disabled={saving || !effective}>
+            {saving ? <Loader2 size={14} className="animate-spin" /> : t('config_save')}
+          </Btn>
+        </>
+      }
+    >
+      {addMode && (
+        <Field label={t('models_provider')}>
+          <Dropdown value={pickId} options={pickOptions} onChange={onPick} />
+        </Field>
+      )}
+      <Field
+        label="API Key"
+        labelAction={effective?.id === 'linkai' ? <ManageLinkAIKeyLink /> : undefined}
+      >
+        <div className="relative">
+          <TextInput
+            type={keyVisible ? 'text' : 'password'}
+            className="pr-10 font-mono"
+            value={apiKey}
+            placeholder="sk-..."
+            onFocus={() => {
+              if (!keyDirty && MASK_RE.test(apiKey)) setApiKey('')
+            }}
+            onBlur={() => {
+              if (!keyDirty) setApiKey(effective?.api_key_masked || '')
+            }}
+            onChange={(e) => {
+              setApiKey(e.target.value)
+              setKeyDirty(true)
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => setKeyVisible((v) => !v)}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-content-tertiary hover:text-content-secondary cursor-pointer p-1"
+          >
+            {keyVisible ? <EyeOff size={14} /> : <EyeIcon size={14} />}
+          </button>
+        </div>
+      </Field>
+      {hasBase && (
+        <Field label="API Base">
+          <TextInput
+            className="font-mono"
+            value={apiBase}
+            onChange={(e) => setApiBase(e.target.value)}
+            placeholder={effective?.api_base_placeholder || 'https://...'}
+          />
+        </Field>
+      )}
+    </Modal>
+  )
+}
+
+const CustomProviderModal: React.FC<{
+  target: ModelProvider | 'new' | null
+  onClose: () => void
+  onSaved: () => Promise<void>
+}> = ({ target, onClose, onSaved }) => {
+  const editing = target && target !== 'new' ? target : null
+  const [name, setName] = useState('')
+  const [apiBase, setApiBase] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [keyDirty, setKeyDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!target) return
+    if (editing) {
+      setName(editing.custom_name || localizedLabel(editing.label))
+      setApiBase(editing.api_base || '')
+      setApiKey(editing.api_key_masked || '')
+    } else {
+      setName('')
+      setApiBase('')
+      setApiKey('')
+    }
+    setKeyDirty(false)
+  }, [target, editing])
+
+  if (!target) return null
+
+  const save = async () => {
+    if (!name.trim()) return
+    setSaving(true)
+    try {
+      const payload: {
+        action: 'set_custom_provider'
+        name: string
+        id?: string
+        api_base: string
+        api_key?: string
+      } = {
+        action: 'set_custom_provider',
+        name: name.trim(),
+        api_base: apiBase.trim(),
+      }
+      if (editing) payload.id = editing.custom_id
+      // 自定义提供程序密钥是可选的。仅当用户触摸它时
+      // 编辑了字段 (keyDirty)，它不是屏蔽占位符；发送
+      // 即使该值为空，因此服务器端也会接受显式清除。
+      if (keyDirty && !MASK_RE.test(apiKey)) payload.api_key = apiKey.trim()
+      await apiClient.modelsAction(payload)
+      await onSaved()
+      onClose()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!editing || !confirm(t('models_delete_confirm'))) return
+    setSaving(true)
+    try {
+      await apiClient.modelsAction({ action: 'delete_custom_provider', id: editing.custom_id || '' })
+      await onSaved()
+      onClose()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Modal
+      open={!!target}
+      title={editing ? t('models_edit_custom') : t('models_add_custom')}
+      onClose={onClose}
+      footer={
+        <>
+          {editing && (
+            <Btn variant="danger" onClick={remove} disabled={saving}>
+              {t('models_delete')}
+            </Btn>
+          )}
+          <Btn variant="ghost" onClick={onClose}>
+            {t('config_cancel')}
+          </Btn>
+          <Btn variant="primary" onClick={save} disabled={saving || !name.trim() || (!editing && !apiBase.trim())}>
+            {saving ? <Loader2 size={14} className="animate-spin" /> : t('config_save')}
+          </Btn>
+        </>
+      }
+    >
+      <Field label={t('models_custom_name')}>
+        <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder="My Provider" />
+      </Field>
+      <Field label="API Base" hint={t('models_custom_base_hint')}>
+        <TextInput
+          className="font-mono"
+          value={apiBase}
+          onChange={(e) => setApiBase(e.target.value)}
+          placeholder="https://...../v1"
+        />
+      </Field>
+      <Field label="API Key">
+        <TextInput
+          type="text"
+          className="font-mono"
+          value={apiKey}
+          placeholder="sk-..."
+          onFocus={() => {
+            if (!keyDirty && MASK_RE.test(apiKey)) setApiKey('')
+          }}
+          onChange={(e) => {
+            setApiKey(e.target.value)
+            setKeyDirty(true)
+          }}
+        />
+      </Field>
+    </Modal>
+  )
+}
+
+// ============================================================
+// 定制能力卡
+// ============================================================
+
+const FallbackHint: React.FC<{ state: CapabilityState; data: ModelsData }> = ({ state, data }) => {
+  if (!state.fallback_provider && !state.fallback_model) return null
+  const label = providerLabel(data, state.fallback_provider || '')
+  return (
+    <p className="text-xs text-content-tertiary">
+      {t('models_fallback')}: {label} {state.fallback_model ? `· ${state.fallback_model}` : ''}
+    </p>
+  )
+}
+
+const TtsCard: React.FC<{
+  state: CapabilityState
+  data: ModelsData
+  busy: boolean
+  status?: string
+  onSaveVoice: (provider: string, model: string, voice: string) => void
+  onSaveMode: (mode: 'off' | 'voice_if_voice' | 'always') => void
+  modeStatus?: string
+  modeBusy: boolean
+}> = ({ state, data, busy, status, onSaveVoice, onSaveMode, modeStatus, modeBusy }) => {
+  const [provider, setProvider] = useState(state.current_provider || '')
+  const [model, setModel] = useState(state.current_model || '')
+  // 自定义（兼容 OpenAI）供应商没有预设目录：输入模型。
+  // 涵盖扩展的自定义：<id> 卡和传统的平面“自定义”条目。
+  const isCustomProvider = (id: string) => id.startsWith('custom:') || id === 'custom'
+  const [customModel, setCustomModel] = useState(
+    isCustomProvider(state.current_provider || '') ? state.current_model || '' : ''
+  )
+  const [voice, setVoice] = useState(state.current_voice || '')
+  const [mode, setMode] = useState<'off' | 'voice_if_voice' | 'always'>(state.reply_mode || 'off')
+
+  const providerOptions = (state.providers || []).map((id) => ({ value: id, label: providerLabel(data, id) }))
+  const modelOptions = normEntries(state.provider_models?.[provider]).map((o) => ({
+    value: o.value,
+    label: o.value,
+    hint: o.hint,
+  }))
+  const voiceOptions = resolveVoices(provider, model, state.provider_voices).map((o) => ({
+    value: o.value,
+    label: o.value,
+    hint: o.hint,
+  }))
+
+  const handleProvider = (id: string) => {
+    setProvider(id)
+    if (isCustomProvider(id)) {
+      // 重新选择同一提供商时，使用保存的模型预填充。
+      setCustomModel(id === state.current_provider ? state.current_model || '' : '')
+      setModel('')
+      setVoice('')
+      return
+    }
+    setCustomModel('')
+    const first = normEntries(state.provider_models?.[id])[0]
+    const fm = first?.value || ''
+    setModel(fm)
+    setVoice(resolveVoices(id, fm, state.provider_voices)[0]?.value || '')
+  }
+  const handleModel = (m: string) => {
+    setModel(m)
+    setVoice(resolveVoices(provider, m, state.provider_voices)[0]?.value || '')
+  }
+  const finalModel = isCustomProvider(provider) ? customModel.trim() : model
+
+  return (
+    <Card icon={<Volume2 size={16} />} title={t('models_cap_tts')} subtitle={t('models_cap_tts_sub')}>
+      <div className="space-y-4">
+        {/* 回复模式——立即保存 */}
+        <Field label={t('models_tts_reply_mode')} hint={t('models_tts_reply_mode_hint')}>
+          <Dropdown
+            value={mode}
+            options={REPLY_MODES.map((m) => ({ value: m.value, label: t(m.key) }))}
+            onChange={(v) => {
+              const next = v as 'off' | 'voice_if_voice' | 'always'
+              setMode(next)
+              onSaveMode(next)
+            }}
+            disabled={modeBusy}
+          />
+          {modeStatus && <span className="text-xs text-accent">{modeStatus}</span>}
+        </Field>
+
+        {mode !== 'off' && (
+          <>
+            <Field label={t('models_provider')}>
+              <Dropdown
+                value={provider}
+                options={providerOptions}
+                placeholder={t('models_select_provider')}
+                onChange={handleProvider}
+              />
+            </Field>
+            <Field label={t('models_model')}>
+              {isCustomProvider(provider) ? (
+                // 定制供应商没有预设目录：直接键入型号。
+                <TextInput
+                  className="font-mono"
+                  value={customModel}
+                  onChange={(e) => setCustomModel(e.target.value)}
+                  placeholder={t('config_custom_model_hint')}
+                />
+              ) : (
+                <Dropdown
+                  value={model}
+                  options={modelOptions}
+                  placeholder={t('models_select_model')}
+                  onChange={handleModel}
+                />
+              )}
+            </Field>
+            {voiceOptions.length > 0 && (
+              <Field label={t('models_voice')}>
+                <Dropdown value={voice} options={voiceOptions} placeholder={t('models_select_voice')} onChange={setVoice} />
+              </Field>
+            )}
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <span className={`text-xs text-accent transition-opacity ${status ? 'opacity-100' : 'opacity-0'}`}>
+                {status}
+              </span>
+              <button
+                disabled={busy}
+                onClick={() => onSaveVoice(provider, finalModel, voice)}
+                className="px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                {busy && <Loader2 size={14} className="animate-spin" />}
+                {t('config_save')}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+const EmbeddingCard: React.FC<{
+  state: CapabilityState
+  data: ModelsData
+  busy: boolean
+  status?: string
+  onSave: (provider: string, model: string) => void
+}> = ({ state, data, busy, status, onSave }) => (
+  <CapabilityCard
+    icon={Database}
+    title={t('models_cap_embedding')}
+    subtitle={t('models_cap_embedding_sub')}
+    capKey="embedding"
+    state={state}
+    data={data}
+    allowAuto
+    autoLabel={t('models_disabled')}
+    busy={busy}
+    status={status}
+    onSave={onSave}
+  >
+    {state.current_dim != null && (
+      <p className="text-xs text-content-tertiary">
+        {t('models_embedding_dim')}: {state.current_dim} · {t('models_embedding_rebuild_hint')}
+      </p>
+    )}
+  </CapabilityCard>
+)
+
+const SearchCard: React.FC<{
+  state: SearchCapabilityState
+  busy: boolean
+  status?: string
+  onSaveStrategy: (strategy: string, provider: string) => void
+  onSaveBochaKey: (key: string) => void
+  keyStatus?: string
+  keyBusy: boolean
+}> = ({ state, busy, status, onSaveStrategy, onSaveBochaKey, keyStatus, keyBusy }) => {
+  const [strategy, setStrategy] = useState<string>(state.strategy || 'auto')
+  const [provider, setProvider] = useState<string>(state.fixed_provider || state.current_provider || '')
+  const [bochaOpen, setBochaOpen] = useState(false)
+
+  const providerOptions = useMemo(
+    () => state.providers.map((p) => ({ value: p.id, label: localizedLabel(p.label) })),
+    [state.providers]
+  )
+  const bocha = state.providers.find((p) => p.id === 'bocha')
+
+  return (
+    <Card icon={<SearchIcon size={16} />} title={t('models_cap_search')} subtitle={t('models_cap_search_sub')}>
+      <div className="space-y-4">
+        <Field label={t('models_search_strategy')}>
+          <Dropdown
+            value={strategy}
+            options={[
+              { value: 'auto', label: t('models_search_auto') },
+              { value: 'fixed', label: t('models_search_fixed') },
+            ]}
+            onChange={setStrategy}
+          />
+        </Field>
+        {strategy === 'fixed' && (
+          <Field label={t('models_search_provider')}>
+            <Dropdown
+              value={provider}
+              options={providerOptions}
+              placeholder={t('models_select_provider')}
+              onChange={setProvider}
+            />
+          </Field>
+        )}
+        <div className="flex items-center justify-between">
+          <button
+            onClick={() => setBochaOpen(true)}
+            className="text-xs text-accent hover:text-accent-hover cursor-pointer inline-flex items-center gap-1"
+          >
+            {t('models_search_bocha_key')}
+            {bocha?.configured && <Check size={12} />}
+          </button>
+          <div className="flex items-center gap-3">
+            <span className={`text-xs text-accent transition-opacity ${status ? 'opacity-100' : 'opacity-0'}`}>
+              {status}
+            </span>
+            <button
+              disabled={busy || (strategy === 'fixed' && !provider)}
+              onClick={() => onSaveStrategy(strategy, provider)}
+              className="px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors disabled:opacity-50 inline-flex items-center gap-2"
+            >
+              {busy && <Loader2 size={14} className="animate-spin" />}
+              {t('config_save')}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <BochaKeyModal
+        open={bochaOpen}
+        masked={bocha?.api_key_masked || ''}
+        busy={keyBusy}
+        status={keyStatus}
+        onClose={() => setBochaOpen(false)}
+        onSave={(k) => {
+          onSaveBochaKey(k)
+          setBochaOpen(false)
+        }}
+      />
+    </Card>
+  )
+}
+
+const BochaKeyModal: React.FC<{
+  open: boolean
+  masked: string
+  busy: boolean
+  status?: string
+  onClose: () => void
+  onSave: (key: string) => void
+}> = ({ open, masked, busy, onClose, onSave }) => {
+  const [key, setKey] = useState('')
+  const [dirty, setDirty] = useState(false)
+  useEffect(() => {
+    if (open) {
+      setKey(masked)
+      setDirty(false)
+    }
+  }, [open, masked])
+  return (
+    <Modal
+      open={open}
+      title={t('models_search_bocha_key')}
+      onClose={onClose}
+      footer={
+        <>
+          <Btn variant="ghost" onClick={onClose}>
+            {t('config_cancel')}
+          </Btn>
+          <Btn variant="primary" disabled={busy} onClick={() => onSave(dirty && !MASK_RE.test(key) ? key : '')}>
+            {busy ? <Loader2 size={14} className="animate-spin" /> : t('config_save')}
+          </Btn>
+        </>
+      }
+    >
+      <Field label="Bocha API Key" hint={t('models_search_bocha_hint')}>
+        <TextInput
+          className="font-mono"
+          value={key}
+          placeholder="sk-..."
+          onFocus={() => {
+            if (!dirty && MASK_RE.test(key)) setKey('')
+          }}
+          onChange={(e) => {
+            setKey(e.target.value)
+            setDirty(true)
+          }}
+        />
+      </Field>
+    </Modal>
+  )
+}
+
+export default ModelsTab

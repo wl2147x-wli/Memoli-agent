@@ -1,0 +1,10 @@
+{
+  "name": "memoli-agent-development-tools",
+  "private": true,
+  "scripts": {
+    "openspec": "openspec"
+  },
+  "devDependencies": {
+    "@fission-ai/openspec": "1.12.0"
+  }
+}

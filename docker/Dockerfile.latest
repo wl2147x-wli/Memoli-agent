@@ -1,0 +1,61 @@
+FROM python:3.10-slim-bullseye
+
+LABEL maintainer="foo@bar.com"
+ARG TZ='Asia/Shanghai'
+
+ARG CHATGPT_ON_WECHAT_VER
+# 设置为“false”以跳过 Playwright/Chromium 并生成较小的图像
+ARG INSTALL_BROWSER=true
+# 设置为“true”以对 apt / pip / playwright 使用中国镜像（在 CN 中更快）
+ARG USE_CN_MIRROR=false
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
+ENV BUILD_PREFIX=/app
+# 使 TZ 环境变量在运行时生效（slim base 默认没有 tzdata）
+ENV TZ=${TZ}
+
+# 可选择将 apt 和 pip 切换到中国镜像
+RUN if [ "$USE_CN_MIRROR" = "true" ]; then \
+        sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list; \
+        pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/; \
+    fi
+
+ADD . ${BUILD_PREFIX}
+
+# 所有大量安装 + 用户创建都在一层中以避免 chown 重复
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ffmpeg espeak libavcodec-extra tzdata \
+    && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo ${TZ} > /etc/timezone \
+    && cd ${BUILD_PREFIX} \
+    && cp config-template.json config.json \
+    && /usr/local/bin/python -m pip install --no-cache --upgrade pip \
+    && pip install --no-cache -r requirements.txt \
+    && pip install --no-cache -r requirements-optional.txt \
+    && pip install --no-cache -e . \
+    && if [ "$INSTALL_BROWSER" = "true" ]; then \
+        apt-get install -y --no-install-recommends fonts-wqy-zenhei \
+        && pip install --no-cache "playwright==1.52.0" \
+        && python -m playwright install-deps chromium \
+        && mkdir -p /app/ms-playwright \
+        && if [ "$USE_CN_MIRROR" = "true" ]; then \
+            PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+            python -m playwright install chromium; \
+        else \
+            python -m playwright install chromium; \
+        fi; \
+    fi \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/agent/cow \
+    && groupadd -r agent \
+    && useradd -r -g agent -s /bin/bash -d /home/agent agent \
+    && chown -R agent:agent /home/agent ${BUILD_PREFIX} /usr/local/lib
+
+WORKDIR ${BUILD_PREFIX}
+
+ADD docker/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh \
+    && chown agent:agent /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,235 +1,213 @@
-# Memoli-agent
+<p align="center"><strong>Memoli-agent</strong></p>
 
-Memoli-agent 是一个面向长期会话、证据化记忆和持续任务的本地 Agent 运行时。
-项目已经具备分层上下文编译、OpenAI/Anthropic Provider、严格工具合同、SQLite
-长期记忆、离线记忆治理、版本化 Skill、插件、持久 SubAgent、Proactive Loop、
-MCP 接入和可回放运行轨迹。
+<p align="center">
+  一个开源的个人 AI 助理（Agent Harness）：主动规划任务、操作电脑与外部服务、创建并运行技能、
+  构建个人知识库与长期记忆，并在日常使用中自我演化。
+</p>
 
-当前可观察行为以 `openspec/specs/` 为事实源；README 用于快速启动和能力导航，
-详细边界与内部设计以 [系统文档](docs/README.md) 为准。
+Memoli-agent 轻量、易部署、易于扩展：可接入主流大模型厂商，7×24 小时运行在个人电脑或服务器上，
+同时服务 Web 控制台与主流 IM 渠道。
 
-## 项目结构
+---
+
+## ✨ 核心特性
+
+| 能力 | 说明 |
+| :--- | :--- |
+| 规划与执行 | 分解复杂任务并逐步执行，围绕工具循环推理直至达成目标 |
+| 记忆 | 三层记忆架构（上下文 → 每日记忆 → MEMORY.md），夜间 Deep Dream 自动蒸馏，关键词 + 向量混合检索 |
+| 知识库 | 自动把对话中的结构化知识整理为 Markdown 知识库，并维护可浏览的知识图谱 |
+| 自我演化 | 自动评审对话以改进技能、跟进未完成任务、沉淀记忆与知识，随使用不断成长 |
+| 技能（Skills） | 以 SKILL.md 清单定义的工作流；支持从 GitHub 等来源安装，或通过对话创建自定义技能 |
+| 工具（Tools） | 内置文件读写、终端、浏览器、定时任务、记忆检索、联网搜索等 10+ 工具，并原生集成 MCP 协议 |
+| 渠道（Channels) | Web 控制台、微信、飞书、钉钉、企业微信、QQ、公众号、Telegram、Slack 等 |
+| 多模态 | 文本、图片、语音、文件的识别、生成与发送 |
+| 模型 | Claude、GPT、Gemini、DeepSeek、Qwen、GLM、Kimi、MiniMax、豆包等主流模型，可在 Web 控制台一键切换 |
+| 部署 | 源码 / Docker 多种部署方式，统一 Web 控制台管理 |
+
+## 🏗️ 架构
+
+Memoli-agent 是一套完整的 **Agent Harness**：消息经由 **Channels（渠道层）** 进入；**Agent 核心**
+（`agent/`）基于记忆、知识库、可用工具与技能进行规划与推理；**Models（模型层）** 生成响应并经原渠道返回。
+各层解耦、可独立扩展。
+
+代码结构概览：
 
 ```text
 Memoli-agent/
-  main.py                  # 兼容启动入口
-  memoli_agent/            # Agent 运行时源码
-    agent/
-      context_management/ # 分层上下文、压缩、快照和 Tool Disclosure
-      core/                # Reasoner 与有界 Agent Loop
-      memory/              # 记忆存储、检索、离线学习和治理
-      tools/               # 内置工具及统一 ToolRegistry
-    bootstrap/             # 配置加载和运行时装配
-    bus/                   # 消息与事件总线
-    channels/              # 外部消息通道
-    plugins/               # 内置插件
-  benchmarks/              # 评测运行器、适配器和任务配置
-  tests/                   # 自动化测试
-  docs/                    # 架构、开发、系统及评测文档
-  openspec/                # 当前行为规格与拟议变更（事实源）
-  docker/code-runner/      # code_run 容器镜像
-  config.example.toml      # 常规运行配置样例
-  config.benchmark.toml    # 评测运行时配置
-  pyproject.toml           # 项目元数据、依赖和工具配置
+├── app.py                  # 进程入口：启动顺序编排（证书→配置→迁移→通道→预热）
+├── config.py               # 配置加载与默认值
+├── run.sh                  # 启动/管理脚本
+│
+├── bridge/                 # 桥接层：连接渠道与 Agent 核心
+│   ├── bridge.py           #   Bot 类型选择与模型路由
+│   ├── agent_bridge.py     #   请求生命周期：路由、运行记录、消息持久化、文件回复
+│   ├── agent_initializer.py#   Agent 初始化：工作区、记忆、工具、技能、系统提示
+│   ├── agent_event_handler.py # 运行事件转发（含流式/中间思考节流）
+│   ├── context.py / reply.py  # 上下文与回复数据结构
+│
+├── agent/                  # Agent 核心
+│   ├── registry.py / routing.py / team.py   # 代理注册表、路由、团队名册
+│   ├── protocol/           #   Agent 抽象与执行器（agent_stream：工具循环、
+│   │                       #   上下文修剪/压缩、重试与后备切换、流式处理）
+│   ├── memory/             #   长期记忆：三层架构、混合检索、切块、嵌入、摘要、Deep Dream
+│   │   └── embedding/      #     嵌入提供者与向量后端
+│   ├── knowledge/          #   个人知识库（Markdown wiki + 知识图谱）
+│   ├── skills/             #   技能系统（SKILL.md 加载、依赖检测、提示注入）
+│   ├── tools/              #   内置工具：bash / 浏览器 / 文件读写 / 搜索 / 定时任务 /
+│   │                       #   视觉 / 联网搜索 / MCP / 发送 / 子代理等
+│   ├── permission/         #   权限模式与路径防护
+│   ├── prompt/             #   系统提示构建与工作区上下文文件
+│   ├── subagent/           #   子代理（并行委派、预算控制）
+│   ├── evolution/          #   自我演化（空闲触发、评审代理、撤销）
+│   ├── chat/ workspace/    #   会话服务与工作区管理
+│   └── observability/      #   （规划中）Langfuse 可观测层
+│
+├── models/                 # 模型层：各厂商适配
+│   ├── openai_compatible_bot.py  # OpenAI 兼容协议统一实现（工具调用/流式）
+│   ├── claudeapi/ chatgpt/ gemini/ openai/ linkai/    # 各厂商 Bot
+│   ├── zhipuai/ dashscope/ doubao/ minimax/ moonshot/ deepseek/
+│   ├── qianfan/ xunfei/ mimo/ modelscope/ baidu/
+│   └── bot_factory.py      #   模型工厂
+│
+├── channel/                # 渠道层
+│   ├── web/                #   Web 控制台（默认渠道，SSE 流式）
+│   ├── feishu/ dingtalk/ wecom_bot/ wechatmp/ wechatcom/ wechat_kf/ weixin/
+│   ├── telegram/ slack/ discord/ qq/
+│   └── channel_instances.py #  多实例渠道管理（多飞书机器人等）
+│
+├── plugins/                # 插件系统（cow_cli / godcmd / banwords 等）
+├── cli/                    # cow 命令行工具（start/stop/skill/backup 等）
+├── skills/                 # 内置技能
+├── common/                 # 公共组件（配置、日志、常量、状态目录、工具函数）
+├── voice/ translate/       # 语音与翻译子模块
+├── tests/                  # 测试
+└── docs/                   # 文档
 ```
 
-完整文档导航见 [docs/README.md](docs/README.md)。
+## 🚀 快速开始
 
-## OpenSpec 开发
+### 源码运行
 
-项目使用 OpenSpec 管理当前能力和后续设计。`openspec/specs/` 是当前可观察
-行为的事实源；新功能、行为修复、兼容性变化和非平凡重构应先创建 change，
-评审规格与设计后再实现，验证通过后归档。
+```bash
+# 1. 克隆仓库并安装依赖
+git clone <your-repo-url> memoli-agent
+cd memoli-agent
+pip install -r requirements.txt
 
-```text
-/opsx:propose <change-name>
-/opsx:apply <change-name>
-/opsx:archive <change-name>
+# 2. 生成配置
+cp config-template.json config.json
+# 编辑 config.json，至少填入一个模型的 api_key
+
+# 3. 启动（Linux / macOS）
+bash run.sh
+
+# 或直接运行
+python app.py
 ```
 
-查看和校验规格：
+### Docker
 
-```powershell
-openspec list --specs
-openspec validate --all --strict
+```bash
+docker build -t memoli-agent .
+docker run -d -p 9899:9899 --name memoli memoli-agent
 ```
 
-完整约定见 [OpenSpec 开发工作流](docs/development/openspec-workflow.md)。
+启动后访问 `http://localhost:9899` 打开 **Web 控制台**——聊天、配置模型、接入渠道、管理技能的一站式入口。
 
-## 安装
+> 部署在服务器上时，请在 `config.json` 中把 `web_host` 设为 `0.0.0.0`，并设置 `web_password` 保护控制台；
+> 记得在防火墙/安全组放行 `9899` 端口（默认端口，可在 `config.json` 的 `web_port` 修改）。
 
-要求 Python 3.11 或更高版本。
+安装后可用 `cow` 命令行管理服务：
 
-Windows PowerShell 推荐使用独立 Conda 环境：
-
-```powershell
-conda create -n memoli python=3.11 -y
-conda activate memoli
-python -m pip install -e ".[dev]"
+```bash
+cow start | stop | restart        # 服务控制
+cow status | logs                 # 状态与日志
+cow skill install <name>          # 安装技能
+cow install-browser               # 安装浏览器自动化
 ```
 
-不使用 Conda 时也可以直接安装：
+## 🤖 模型
 
-```powershell
-python -m pip install -e .
+支持主流大模型厂商。**对话、视觉、图像生成、语音识别/合成、嵌入**可以分别路由到不同厂商，
+全部在 Web 控制台内配置，无需手改文件。
+
+| 厂商 | 代表模型 | 对话 | 视觉 | 图像生成 | 语音识别 | 语音合成 | 嵌入 |
+| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |
+| DeepSeek | deepseek-v4 系列 | ✅ | | | | | |
+| Claude | claude-opus / sonnet | ✅ | ✅ | | | | |
+| OpenAI | gpt-5 系列 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Gemini | gemini 系列模型 | ✅ | ✅ | ✅ | | | |
+| MiniMax | MiniMax-M3 | ✅ | ✅ | ✅ | | ✅ | |
+| GLM | glm-5.3-flash | ✅ | ✅ | | ✅ | | ✅ |
+| Qwen | qwen3.8-flash | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Kimi | kimi-k3 | ✅ | ✅ | | | | |
+| 豆包 | doubao-seed 系列 | ✅ | ✅ | ✅ | | | ✅ |
+| 文心 | ernie 系列 | ✅ | ✅ | | | | |
+| MiMo | mimo 系列 | ✅ | ✅ | | | ✅ | |
+| 自定义 | 本地模型 / 第三方代理（OpenAI 兼容） | ✅ | | | | | |
+
+## 💬 渠道
+
+单个 Agent 实例可同时服务多个渠道，大部分渠道可直接在 Web 控制台完成配置。
+
+| 渠道 | 文本 | 图片 | 文件 | 语音 | 群聊 |
+| --- | :-: | :-: | :-: | :-: | :-: |
+| Web 控制台（默认） | ✅ | ✅ | ✅ | ✅ | |
+| Telegram | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Slack | ✅ | ✅ | ✅ | | ✅ |
+| Discord | ✅ | ✅ | ✅ | | ✅ |
+| 微信 | ✅ | ✅ | ✅ | ✅ | |
+| 飞书 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 钉钉 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 企业微信机器人 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| QQ | ✅ | ✅ | ✅ | | ✅ |
+| 企业微信应用 | ✅ | ✅ | ✅ | ✅ | |
+| 微信客服 | ✅ | ✅ | ✅ | ✅ | |
+| 微信公众号 | ✅ | ✅ | | ✅ | |
+
+## 🧠 记忆与知识库
+
+**长期记忆**采用三层架构：会话上下文（短期）→ 每日记忆（中期）→ MEMORY.md（长期）。
+每晚会执行一次 **Deep Dream**，把零散记忆蒸馏为精炼的长期条目与叙事日志。
+
+**个人知识库**按主题（而非时间线）组织结构化知识：Agent 自动从对话中提炼有价值的信息、
+维护交叉引用与索引，Web 控制台提供交互式知识图谱视图。
+
+## 🔧 工具与技能
+
+**工具**是 Agent 操作系统资源与外部服务的原子能力；**技能**是通过 SKILL.md 清单定义的
+更高层工作流，组合多个工具完成复杂任务。
+
+### 工具系统
+
+内置工具覆盖：文件读写（`read` / `write` / `edit` / `ls`）、终端（`bash`）、文件发送（`send`）、
+记忆检索（`memory`）、环境变量（`env_config`）、网页抓取（`web_fetch`）、定时任务（`scheduler`）、
+联网搜索（`web_search`）、视觉（`vision`）、浏览器自动化（`browser`）等。
+
+**MCP 协议**：一个 `mcp.json` 即可接入 Model Context Protocol 服务器的开放生态，
+支持 stdio / SSE 传输、热重载与按需工具检索。
+
+### 技能系统
+
+- 从 GitHub 等任意来源安装技能，或使用 `skill-creator` 通过对话生成自定义技能
+- 技能以 Markdown 清单描述依赖、安装方式与使用流程，Agent 自动判断可用性
+
+```bash
+/skill list                    # 查看已安装技能
+/skill search <keyword>        # 搜索技能
+/skill install <name>          # 一键安装
 ```
 
-安装测试、代码检查和类型检查工具：
+## 🛠️ 开发与贡献
 
-```powershell
-python -m pip install -e ".[dev]"
-```
+欢迎各种形式的贡献：新功能、Bug 修复、性能优化、文档改进。请阅读
+[CONTRIBUTING.md](CONTRIBUTING.md) 后提交 Issue 或 Pull Request。
 
-项目依赖统一由 `pyproject.toml` 管理。
+## ⚠️ 免责声明
 
-## 配置与运行
-
-复制配置样例并启动：
-
-```powershell
-Copy-Item config.example.toml config.toml
-memoli
-```
-
-示例配置默认使用不联网的 `EchoProvider`，用于验证 CLI 和本地运行时。接入正式模型
-时，在 `config.toml` 中选择 `openai`、`anthropic` 或 `openai-compatible`，并通过
-环境变量提供密钥；不要把真实密钥写入仓库。
-
-`memoli` 无参数时启动前台 CLI 对话；`memoli chat` 是等价的显式写法。
-可以用公共参数选择配置、工作目录和本地会话：
-
-```powershell
-memoli --config config.toml --workspace workspace --session local
-memoli chat --config config.toml --session research
-```
-
-交互式 TTY 默认启用逐键编辑、进程内历史、Rich Markdown、模型流式输出、底部
-状态栏和 `/` 命令面板。输入 `/` 后可用方向键选择、Tab 补全、Enter 提交、Esc
-关闭面板；Alt+Enter 或 Esc+Enter 插入换行。Ctrl+C 在任务运行时等价于 `/stop`，
-空闲时清空输入；空缓冲区 Ctrl+D 正常退出。输入仍串行进入 Agent Loop，运行中
-可以继续排队，队列达到配置上限后会拒绝新的普通消息。
-
-本地斜杠命令不会调用模型，也不会写入普通 Session 消息或被动 turn 轨迹：
-
-```text
-/help        查看命令帮助
-/status      查看非敏感 Runtime 配置摘要
-/checkpoint 查看当前会话工作 checkpoint（/working 为别名）
-/trace       查看当前会话最近一个 trace id
-/clear       创建新 conversation epoch，并重置当前会话派生上下文
-/stop        只停止当前 turn，不退出 Runtime
-/workspace   查看当前工作目录（首版只读）
-/model       查看 Provider、模型与 streaming 状态（首版只读）
-/tools       查看可用工具（首版只读）
-/memory      查看记忆状态；也用于候选审核和失败恢复
-/skills      查看 Skill catalog 可用状态（不会加载 Skill）
-/context     查看 epoch、分层预算、压缩、frontier、outbox 和熔断诊断
-/exit        退出（/quit 为别名）
-//text       将 /text 作为普通消息发送给模型
-```
-
-`/clear` 不删除长期记忆、原始轨迹、受管 payload 或 working checkpoint。记忆候选审核
-要求显式确认，并使用 revision 防止批准过期版本：
-
-```text
-/memory candidates
-/memory show <candidate-id>
-/memory approve <candidate-id> <revision> confirm
-/memory reject <candidate-id> <revision> confirm
-/memory recovery
-/memory retry-job <job-id> confirm
-/memory retry-request <request-id> confirm
-/memory suppress-request <request-id> confirm
-```
-
-stdin/stdout 被管道或重定向、增强终端初始化失败，或设置
-`channels.cli.interactive = false` 时自动使用无 ANSI/动画的 plain CLI。设置
-`NO_COLOR=1` 可关闭颜色。正式 Provider 默认 `llm.stream = true`；需要一次性输出时
-显式设置 `llm.stream = false`。Echo Provider 即使默认配置为 true 也会按能力自动
-使用非流式调用。
-
-plain CLI 不是另一套旧终端实现：interactive 与 plain 共用同一个命令注册表、
-`CLIController`、排队/取消边界和 renderer 状态机。plain adapter 只降级逐键编辑、
-候选面板、颜色与动画，因此管道和 CI 行为不会与交互模式产生两套业务语义。
-
-无需启动 Provider、插件、MCP 或 Agent Loop，即可离线只读查询已保存的工作状态：
-
-```powershell
-memoli checkpoint --config config.toml --session research
-memoli checkpoint --config config.toml --session research --json
-```
-
-离线查询不会创建数据库，也不会恢复或更新 checkpoint。没有记录或功能关闭时
-返回退出码 `3`，存储读取失败返回 `1`。旧入口仍兼容，并委托给同一套 CLI 生命周期：
-
-```powershell
-python main.py --config config.toml --session local
-```
-
-`config.toml`、`.env`、`workspace/` 和 `logs/` 是本地运行内容，不应提交。
-没有 `config.toml` 时，Agent 显式使用 `EchoProvider`；一旦选择正式 Provider，
-缺少 API key 会快速失败。OpenAI、Anthropic 和 OpenAI-compatible 服务均通过
-`config.toml` 配置，详见 [LLM Providers](docs/systems/llm-providers.md)。
-
-## 记忆启用边界
-
-示例配置默认开启长期记忆存储与自动召回，但关闭离线提取和语义 Embedding：
-
-- `[memory].enabled = true`：启用 SQLite 记忆库和在线召回。
-- `[memory].consolidation_enabled = false`：不启动离线 Consolidation Worker。
-- `[memory.embedding].enabled = false`：混合检索仍可使用 FTS、Pattern 和 metadata lane。
-- `[memory.offline.extractor].provider = "disabled"`：不会从普通对话自动提取候选记忆。
-
-要启用完整离线学习，需要同时开启 consolidation、配置有效 Extractor，并根据需要
-开启自动扫描；治理阶段使用内部 `memory-governor` SubAgent，只绑定治理专用工具，
-不会把治理工具暴露给主 Agent。候选记忆不会绕过 Policy Gate 自动成为正式记忆，
-需要满足自动批准策略或由用户通过 `/memory` 明确审核。详细配置见
-[记忆系统](docs/systems/memory.md)。
-
-## 核心能力
-
-- 上下文系统：以 `(session_key, conversation_epoch)` 冻结稳定快照，按 token 预算
-  编译 system、Skill、记忆、working state、历史 turn、archive frontier 和工具 schema；
-  支持 soft/hard/emergency 多层压缩、恢复诊断和 fail-closed 能力撤销。
-- 工具系统：异步 `Tool` 协议与 `ToolRegistry`，在执行前按 JSON Schema Draft
-  2020-12 统一校验参数，安全 Hook 改写后再次校验。`code_run` 只声明当前 runner
-  实际支持的语言；设置 `code_runner = "disabled"` 时不注册该工具。
-- 渐进工具披露：可选 `tool_search` 将完整 schema 持久化到当前 Session/Epoch 的
-  Disclosure Ledger，下一轮 Provider 请求才获得并授权执行；其他会话不会继承，
-  未披露工具不能靠猜测名称调用。
-- Agent Runtime：有边界的串行模型/工具循环，以及可查询、可导出的 SQLite 完整运行轨迹。
-- LLM Providers：OpenAI Chat Completions、OpenAI-compatible 与 Anthropic
-  Messages 原生异步 Adapter、流式事件、能力路由、有界重试和真实模型 fallback。
-- 记忆系统：独立 working state、Claim/Evidence/Card/Episode 分层存储，FTS、Pattern、
-  semantic、metadata 多 lane 召回与加权 RRF/MMR 融合，Card 优先检索和按需
-  Claim/Evidence 展开；离线候选经租约、重试、治理 SubAgent 和用户审核闭环进入正式记忆。
-- 插件系统：生命周期 Hook、工具执行前 Hook 和内置安全插件。
-- SubAgent：SQLite 持久化 Agent Tree/Task DAG、受限工具循环、依赖调度、取消恢复及完成事件回流。
-- Skill Runtime：SQLite 不可变版本治理、Session 快照 Catalog、只读渐进加载和可审计使用事件。
-- Proactive：可配置的主动检查循环。
-- MCP：通过 stdio 接入外部 MCP Server，并注册为统一工具。
-
-各能力的配置和限制见 [系统文档](docs/systems/)。
-
-## 评测
-
-评测配置位于 `benchmarks/`。数据集路径默认按项目同级目录解析，例如
-`../locomo/` 和 `../LongMemEval/`；可按本机数据集位置调整。
-
-```powershell
-python -m benchmarks.run --config benchmarks/config.locomo.toml
-```
-
-详见 [评测架构](docs/benchmarks/architecture.md) 和
-[评测配置](docs/benchmarks/configuration.md)。
-
-## 开发验证
-
-```powershell
-python -m pytest -q
-python -m ruff check memoli_agent benchmarks tests
-python -m pyright
-openspec validate --all --strict
-```
-
-行为变化必须先通过 OpenSpec change 描述、实现和验证；完成后同步主规格并归档。
+1. 本项目基于 MIT 许可证开源，仅供技术研究与学习使用。使用者需自行遵守所在地区的法律法规，
+   项目维护者不对使用本项目产生的任何后果承担责任。
+2. **成本与安全**：Agent 模式的 token 消耗显著高于普通对话，请选择质量与成本平衡的模型。
+   Agent 可以访问本地操作系统，请只在受信任的环境中部署。
+3. 本项目为纯开源项目，不参与、不授权、不发行任何加密货币。
